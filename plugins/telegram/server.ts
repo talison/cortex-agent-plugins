@@ -308,6 +308,21 @@ function gate(ctx: Context): GateResult {
   return { action: 'drop' }
 }
 
+// Like gate() but for bot commands: no pairing side effects, just allow/drop.
+// Cherry-picked from upstream 5a71459 (#894) — command handlers previously
+// bypassed dmPolicy and leaked bot presence in allowlist/disabled modes.
+function dmCommandGate(ctx: Context): { access: Access; senderId: string } | null {
+  if (ctx.chat?.type !== 'private') return null
+  if (!ctx.from) return null
+  const senderId = String(ctx.from.id)
+  const access = loadAccess()
+  const pruned = pruneExpired(access)
+  if (pruned) saveAccess(access)
+  if (access.dmPolicy === 'disabled') return null
+  if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
+  return { access, senderId }
+}
+
 // The /telegram:access skill drops a file at approved/<senderId> when it pairs
 // someone. Poll for it, send confirmation, clean up. For Telegram DMs,
 // chatId == senderId, so we can send directly without stashing chatId.
@@ -661,12 +676,7 @@ setInterval(() => {
 // the gate's behavior for unrecognized groups.
 
 bot.command('start', async ctx => {
-  if (ctx.chat?.type !== 'private') return
-  const access = loadAccess()
-  if (access.dmPolicy === 'disabled') {
-    await ctx.reply(`This bot isn't accepting new connections.`)
-    return
-  }
+  if (!dmCommandGate(ctx)) return
   await ctx.reply(
     `This bot bridges Telegram to a Claude Code session.\n\n` +
     `To pair:\n` +
@@ -677,7 +687,7 @@ bot.command('start', async ctx => {
 })
 
 bot.command('help', async ctx => {
-  if (ctx.chat?.type !== 'private') return
+  if (!dmCommandGate(ctx)) return
   await ctx.reply(
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
@@ -687,14 +697,12 @@ bot.command('help', async ctx => {
 })
 
 bot.command('status', async ctx => {
-  if (ctx.chat?.type !== 'private') return
-  const from = ctx.from
-  if (!from) return
-  const senderId = String(from.id)
-  const access = loadAccess()
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const { access, senderId } = gated
 
   if (access.allowFrom.includes(senderId)) {
-    const name = from.username ? `@${from.username}` : senderId
+    const name = ctx.from?.username ? `@${ctx.from.username}` : senderId
     await ctx.reply(`Paired as ${name}.`)
     return
   }
@@ -955,9 +963,10 @@ async function handleInbound(
         ...(ctx.message?.reply_to_message?.message_id != null
           ? { reply_to_message_id: String(ctx.message.reply_to_message.message_id) }
           : {}),
-        ...((ctx.message?.reply_to_message?.text ?? ctx.message?.reply_to_message?.caption) != null
-          ? { reply_to_message_text: ctx.message.reply_to_message.text ?? ctx.message.reply_to_message.caption }
-          : {}),
+        ...(() => {
+          const replyText = ctx.message?.reply_to_message?.text ?? ctx.message?.reply_to_message?.caption
+          return replyText != null ? { reply_to_message_text: replyText } : {}
+        })(),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
