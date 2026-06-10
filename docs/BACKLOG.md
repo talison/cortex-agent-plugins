@@ -30,6 +30,14 @@ worth its rollout cost at review time.
   (single operator, rare permission prompts). Revisit if permission volume
   ever changes.
 
+## watch-for (blocked on Claude Code support)
+
+- **Session-control commands over Telegram** (`/compact` etc., asked
+  2026-06-09) — channel messages arrive as model-visible text; slash commands
+  are TUI input-layer constructs. Nothing in the channel/MCP protocol lets a
+  plugin invoke session commands today. If Claude Code ever exposes session
+  control to channels, add a `/compact` bot command alongside /status.
+
 ## process
 
 - **Upstream sync is manual** — `docs/UPSTREAM.md` describes a weekly check
