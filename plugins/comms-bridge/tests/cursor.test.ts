@@ -84,3 +84,25 @@ describe('Cursor', () => {
     }
   })
 })
+
+describe('Cursor.onReset', () => {
+  test('fires on unparseable content, not on missing file', () => {
+    const dir = fixtureDir()
+    try {
+      const path = join(dir, 'reset.cursor')
+      const c = new Cursor(path)
+      const reasons: string[] = []
+      c.onReset = r => reasons.push(r)
+
+      expect(c.read()).toBe(0) // missing file — normal first boot
+      expect(reasons).toEqual([])
+
+      writeFileSync(path, 'not-a-number\n')
+      expect(c.read()).toBe(0)
+      expect(reasons.length).toBe(1)
+      expect(reasons[0]).toContain('not-a-number')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

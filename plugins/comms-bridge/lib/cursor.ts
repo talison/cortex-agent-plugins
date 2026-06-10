@@ -9,18 +9,26 @@
  * reset to 0 — the bridge will resend any messages we missed during downtime,
  * which is cheaper than failing closed.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
 
 export class Cursor {
+  /** Called when read() resets defensively so the replay is diagnosable. */
+  onReset?: (reason: string) => void
+
   constructor(private readonly path: string) {}
 
   read(): number {
     try {
       const raw = readFileSync(this.path, 'utf8').trim()
       const n = Number.parseInt(raw, 10)
-      return Number.isFinite(n) && n >= 0 ? n : 0
-    } catch {
+      if (Number.isFinite(n) && n >= 0) return n
+      this.onReset?.(`unparseable cursor content: ${JSON.stringify(raw.slice(0, 40))}`)
+      return 0
+    } catch (err) {
+      // Missing file is the normal first-boot case — only a present-but-unreadable
+      // file is worth surfacing.
+      if (existsSync(this.path)) this.onReset?.(`cursor read failed: ${String(err)}`)
       return 0
     }
   }

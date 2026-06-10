@@ -38,7 +38,12 @@ import { renderPayload } from './lib/payload.ts'
 const AGENT = 'cortex'
 const ALLOWED_PEERS = new Set(['max'])
 const ALLOWED_KINDS = new Set(['request', 'response', 'notify'])
+// Long-poll window. The service clamps to its own MAX_TIMEOUT (60s) server-side
+// — values above that are silently shortened, so keep this below it.
 const POLL_TIMEOUT_SECONDS = 25
+// Mirrors the service's PAYLOAD_MAX_BYTES so oversized sends fail fast with a
+// clear error instead of buffering a doomed POST into a 413.
+const PAYLOAD_MAX_BYTES = 64 * 1024
 
 const STATE_DIR =
   process.env.COMMS_BRIDGE_STATE_DIR ??
@@ -84,10 +89,11 @@ process.on('uncaughtException', err => {
 })
 
 const cursor = new Cursor(CURSOR_PATH)
+cursor.onReset = reason => debugLog('cursor reset to 0 — full replay ahead', { reason })
 const bridge = new BridgeClient({ baseUrl: BRIDGE_BASE_URL })
 
 const mcp = new Server(
-  { name: 'comms-bridge', version: '0.1.0' },
+  { name: 'comms-bridge', version: '0.1.1' },
   {
     capabilities: {
       tools: {},
@@ -174,6 +180,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const body: unknown =
           text != null ? String(text) : (payload as Record<string, unknown>)
+        const bodyBytes = Buffer.byteLength(JSON.stringify(body), 'utf8')
+        if (bodyBytes > PAYLOAD_MAX_BYTES) {
+          throw new Error(
+            `payload is ${bodyBytes} bytes — bridge cap is ${PAYLOAD_MAX_BYTES}. ` +
+              'Write large content to a file and send the path instead.',
+          )
+        }
 
         const kindRaw = (args.kind as string | undefined) ?? 'notify'
         if (!ALLOWED_KINDS.has(kindRaw)) {
@@ -325,7 +338,17 @@ void (async () => {
           break
         }
         // Per-message cursor advance — if we crash mid-batch we resume after
-        // the last successfully delivered message.
+        // the last successfully delivered message. Guard the id: a malformed
+        // response (null/NaN id) written to the cursor would floor to 0 and
+        // trigger a full replay storm on the next poll.
+        if (!Number.isFinite(msg.id) || msg.id <= cursorValue) {
+          debugLog('suspicious message id — cursor not advanced', {
+            uuid: msg.uuid,
+            id: msg.id,
+            cursor: cursorValue,
+          })
+          continue
+        }
         cursorValue = msg.id
         cursor.write(cursorValue)
         // Fire-and-forget ack so the bridge can mark the row acked. Failure
