@@ -930,10 +930,14 @@ async function handleInbound(
   }
 
   // Typing indicator — persists until the reply tool fires stopTyping(chat_id)
-  // or the 3-minute safety cap in startTyping auto-stops. Telegram's native
-  // typing expires in ~5s; startTyping re-emits every 4s to keep it visible
-  // across the full processing window (tool calls, LLM latency, etc).
-  startTyping(bot.api, chat_id)
+  // or the 3-minute safety cap auto-stops. (The module default is 90s — tuned
+  // for harness's quick-reply pattern; Cortex turns routinely run tools for
+  // minutes before the first reply, so we pass the cap explicitly.) Telegram's
+  // native typing expires in ~5s; startTyping re-emits every 4s to keep it
+  // visible across the full processing window. For work longer than the cap,
+  // the ack-reply protocol in CLAUDE.md is the real progress channel — typing
+  // beyond a few minutes would keep signaling even if the session died.
+  startTyping(bot.api, chat_id, { maxMs: 180_000 })
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
