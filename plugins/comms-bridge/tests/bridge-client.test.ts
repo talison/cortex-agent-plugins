@@ -182,6 +182,89 @@ describe('BridgeClient.ack', () => {
   })
 })
 
+describe('BridgeClient bearer token', () => {
+  function okFor(url: string): Response {
+    if (url.includes('/inbox')) {
+      return new Response(JSON.stringify({ messages: [], next_cursor: 0 }), {
+        status: 200,
+      })
+    }
+    if (url.includes('/send')) {
+      return new Response(
+        JSON.stringify({
+          id: 1,
+          uuid: 'u1',
+          stored_at: '2026-07-29T00:00:00Z',
+          duplicate: false,
+        }),
+        { status: 201 },
+      )
+    }
+    return new Response(JSON.stringify({ ok: true, updated: true }), {
+      status: 200,
+    })
+  }
+
+  async function callAll(token?: string): Promise<RecordedCall[]> {
+    const { calls, impl } = fakeFetch(url => okFor(url))
+    const client = new BridgeClient({
+      baseUrl: 'http://test',
+      fetchImpl: impl,
+      token,
+    })
+    await client.inbox('cortex', 0, 25)
+    await client.send({
+      uuid: 'u1',
+      from_agent: 'cortex',
+      to_agent: 'max',
+      kind: 'notify',
+      payload: 'hi',
+    })
+    await client.ack('u1')
+    expect(calls).toHaveLength(3)
+    return calls
+  }
+
+  test('attaches Authorization to inbox, send and ack', async () => {
+    const calls = await callAll('sekrit')
+    for (const call of calls) {
+      const headers = call.init?.headers as Record<string, string>
+      expect(headers.authorization).toBe('Bearer sekrit')
+    }
+    // the POST bodies keep their content-type alongside the token
+    const posts = calls.slice(1)
+    for (const call of posts) {
+      const headers = call.init?.headers as Record<string, string>
+      expect(headers['content-type']).toBe('application/json')
+    }
+  })
+
+  test('omits Authorization entirely with no token', async () => {
+    const calls = await callAll()
+    // GET /inbox goes out with no headers at all, exactly as pre-auth
+    expect(calls[0].init?.headers).toBeUndefined()
+    for (const call of calls.slice(1)) {
+      const headers = call.init?.headers as Record<string, string>
+      expect(headers).toEqual({ 'content-type': 'application/json' })
+    }
+  })
+
+  test('treats a blank token as no token', async () => {
+    const calls = await callAll('   ')
+    expect(calls[0].init?.headers).toBeUndefined()
+    for (const call of calls.slice(1)) {
+      const headers = call.init?.headers as Record<string, string>
+      expect(headers.authorization).toBeUndefined()
+    }
+  })
+
+  test('trims surrounding whitespace from the token', async () => {
+    const calls = await callAll('  sekrit\n')
+    const headers = calls[0].init?.headers as Record<string, string>
+    expect(headers.authorization).toBe('Bearer sekrit')
+  })
+})
+
 describe('BridgeClient.baseUrl normalization', () => {
   test('strips trailing slashes', async () => {
     const { calls, impl } = fakeFetch(() =>

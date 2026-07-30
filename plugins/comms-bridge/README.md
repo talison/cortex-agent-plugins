@@ -15,6 +15,16 @@ The plugin is a sidecar Bun process loaded by Claude Code via `--dangerously-loa
 
 The bridge service lives in [`talison/cortex/comms-bridge/`](https://github.com/talison/cortex/tree/main/comms-bridge) (FastAPI + SQLite WAL on port 9475). It must be running for this plugin to function — managed by launchd (`ai.cortex.comms-bridge`).
 
+### Auth
+
+The service gates `/send`, `/inbox` and `/ack` behind `Authorization: Bearer <token>`. The plugin resolves the token once at startup: `COMMS_BRIDGE_TOKEN` if the environment sets it, otherwise the Keychain item the service's other clients read —
+
+```sh
+security find-generic-password -a comms-bridge -s agent-token -w
+```
+
+No token found is non-fatal (one line in the debug log, requests go out unauthenticated) — correct while the service runs in `report-only` mode, a 401 once it flips to `required`. The token value is never logged.
+
 Plugin debug log: `~/.claude/channels/comms-bridge/logs/fork-debug.log`.
 
 ## Tests

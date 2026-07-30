@@ -57,15 +57,36 @@ export class BridgeError extends Error {
 export interface BridgeClientOpts {
   baseUrl?: string
   fetchImpl?: typeof fetch
+  /**
+   * Bearer token for the service's auth gate. Omitted/empty means send
+   * unauthenticated — fine while the service runs in report-only mode, a 401
+   * once it flips to required. Resolved by the caller (server.ts) so this
+   * module stays a pure HTTP client.
+   */
+  token?: string
 }
 
 export class BridgeClient {
   private readonly baseUrl: string
   private readonly fetchImpl: typeof fetch
+  private readonly token: string | undefined
 
   constructor(opts: BridgeClientOpts = {}) {
     this.baseUrl = (opts.baseUrl ?? 'http://127.0.0.1:9475').replace(/\/+$/, '')
     this.fetchImpl = opts.fetchImpl ?? fetch
+    this.token = opts.token?.trim() || undefined
+  }
+
+  /**
+   * `base` plus the bearer token when one is configured. Returns `base`
+   * untouched (including `undefined`) when there's no token, so the tokenless
+   * request is byte-identical to the pre-auth behaviour.
+   */
+  private headers(
+    base?: Record<string, string>,
+  ): Record<string, string> | undefined {
+    if (!this.token) return base
+    return { ...base, authorization: `Bearer ${this.token}` }
   }
 
   /**
@@ -85,7 +106,10 @@ export class BridgeClient {
     url.searchParams.set('agent', agent)
     url.searchParams.set('since', String(since))
     url.searchParams.set('timeout', String(timeoutSeconds))
-    const res = await this.fetchImpl(url.toString(), { signal })
+    const res = await this.fetchImpl(url.toString(), {
+      headers: this.headers(),
+      signal,
+    })
     if (!res.ok) {
       const body = await safeText(res)
       throw new BridgeError(
@@ -100,7 +124,7 @@ export class BridgeClient {
   async send(args: SendArgs): Promise<SendResponse> {
     const res = await this.fetchImpl(`${this.baseUrl}/send`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.headers({ 'content-type': 'application/json' }),
       body: JSON.stringify({
         uuid: args.uuid,
         from_agent: args.from_agent,
@@ -124,7 +148,7 @@ export class BridgeClient {
   async ack(uuid: string): Promise<{ ok: boolean; updated: boolean }> {
     const res = await this.fetchImpl(`${this.baseUrl}/ack`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.headers({ 'content-type': 'application/json' }),
       body: JSON.stringify({ uuid }),
     })
     if (!res.ok) {

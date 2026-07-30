@@ -25,6 +25,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { spawnSync } from 'child_process'
 import { appendFileSync, mkdirSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -75,7 +76,44 @@ function debugLog(msg: string, ctx?: Record<string, unknown>): void {
   } catch {}
 }
 
-debugLog(`startup: ppid=${process.ppid} bridge=${BRIDGE_BASE_URL}`)
+/**
+ * Bearer token for the bridge's auth gate: `COMMS_BRIDGE_TOKEN` if the env
+ * provides one, else the Keychain item the other clients read
+ * (`security find-generic-password -a comms-bridge -s agent-token -w`).
+ *
+ * Resolved once at startup — the token is stable for the process lifetime and
+ * a Keychain read per request would be absurd. Absence is non-fatal: the
+ * service is in report-only mode, so an unauthenticated caller still works and
+ * only shows up in the service's reject log. The value is never logged.
+ */
+function resolveBridgeToken(): string | undefined {
+  const fromEnv = process.env.COMMS_BRIDGE_TOKEN?.trim()
+  if (fromEnv) return fromEnv
+  try {
+    const proc = spawnSync(
+      '/usr/bin/security',
+      ['find-generic-password', '-a', 'comms-bridge', '-s', 'agent-token', '-w'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    )
+    const token = proc.status === 0 ? (proc.stdout ?? '').trim() : ''
+    if (token) return token
+    debugLog('bridge token unavailable — requests will be unauthenticated', {
+      source: 'keychain',
+      exit_code: proc.status,
+    })
+  } catch (err) {
+    debugLog('bridge token lookup failed — requests will be unauthenticated', {
+      error: String(err),
+    })
+  }
+  return undefined
+}
+
+const BRIDGE_TOKEN = resolveBridgeToken()
+
+debugLog(
+  `startup: ppid=${process.ppid} bridge=${BRIDGE_BASE_URL} auth=${BRIDGE_TOKEN ? 'token' : 'none'}`,
+)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. Same pattern as telegram fork.
@@ -90,10 +128,13 @@ process.on('uncaughtException', err => {
 
 const cursor = new Cursor(CURSOR_PATH)
 cursor.onReset = reason => debugLog('cursor reset to 0 — full replay ahead', { reason })
-const bridge = new BridgeClient({ baseUrl: BRIDGE_BASE_URL })
+const bridge = new BridgeClient({
+  baseUrl: BRIDGE_BASE_URL,
+  token: BRIDGE_TOKEN,
+})
 
 const mcp = new Server(
-  { name: 'comms-bridge', version: '0.1.1' },
+  { name: 'comms-bridge', version: '0.1.2' },
   {
     capabilities: {
       tools: {},

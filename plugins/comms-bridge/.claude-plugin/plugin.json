@@ -1,7 +1,7 @@
 {
   "name": "comms-bridge",
   "description": "Agent-to-agent comms channel for Claude Code (Cortex side). Long-polls the comms-bridge HTTP service (127.0.0.1:9475) and exposes a send tool for outbound messages to Max.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "keywords": [
     "agent-to-agent",
     "comms",
