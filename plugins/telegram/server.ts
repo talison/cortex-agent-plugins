@@ -28,6 +28,7 @@ import {
 } from './core/index.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
+import { execFileSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -651,23 +652,30 @@ if (!shuttingDown) {
     const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
     if (stale > 1 && stale !== process.pid) {
       process.kill(stale, 0)
-      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-      process.kill(stale, 'SIGTERM')
+      // PID files race with OS PID recycling — verify the holder is actually a
+      // server.ts process before SIGTERM. Otherwise a recycled PID can point at
+      // our own bun-run wrapper (kills our stdin → immediate self-shutdown) or
+      // an unrelated user process. (Upstream #1424; ps-missing falls through
+      // the enclosing catch to just overwriting the lockfile.)
+      const cmd = execFileSync('ps', ['-p', String(stale), '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      if (cmd.includes('server.ts')) {
+        process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+        process.kill(stale, 'SIGTERM')
+      }
     }
   } catch {}
   writeFileSync(PID_FILE, String(process.pid))
 }
 
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
+// Orphan watchdog: belt-and-suspenders for the stdin 'end'/'close' handlers
+// above. Stdin is the MCP transport pipe inherited straight from the CLI; the
+// kernel closes it on any CLI death (clean, crash, SIGKILL, OOM) regardless of
+// intermediate wrappers. A ppid-change check used to live here but it
+// false-fires when the bun-run/shell wrapper exits or execs during normal
+// startup and we get reparented to init — plugin self-terminated ~5s after
+// launch. (Upstream #1424 / their #1467.)
 setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown('watchdog:orphan')
+  if (process.stdin.destroyed || process.stdin.readableEnded) shutdown('watchdog:orphan')
 }, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
