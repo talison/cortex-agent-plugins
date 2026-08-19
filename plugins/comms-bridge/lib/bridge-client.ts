@@ -59,9 +59,9 @@ export interface BridgeClientOpts {
   fetchImpl?: typeof fetch
   /**
    * Bearer token for the service's auth gate. Omitted/empty means send
-   * unauthenticated — fine while the service runs in report-only mode, a 401
-   * once it flips to required. Resolved by the caller (server.ts) so this
-   * module stays a pure HTTP client.
+   * unauthenticated — a guaranteed 401 now that the service runs with auth
+   * required; the caller (server.ts) resolves the token and swaps it in via
+   * `setToken` after a 401, so this module stays a pure HTTP client.
    */
   token?: string
 }
@@ -69,12 +69,21 @@ export interface BridgeClientOpts {
 export class BridgeClient {
   private readonly baseUrl: string
   private readonly fetchImpl: typeof fetch
-  private readonly token: string | undefined
+  private token: string | undefined
 
   constructor(opts: BridgeClientOpts = {}) {
     this.baseUrl = (opts.baseUrl ?? 'http://127.0.0.1:9475').replace(/\/+$/, '')
     this.fetchImpl = opts.fetchImpl ?? fetch
     this.token = opts.token?.trim() || undefined
+  }
+
+  /**
+   * Swap the bearer token mid-lifetime — the caller re-resolves it after a
+   * 401 (the token read can fail at startup when the keychain is locked).
+   * Empty/undefined drops back to unauthenticated requests.
+   */
+  setToken(token: string | undefined): void {
+    this.token = token?.trim() || undefined
   }
 
   /**

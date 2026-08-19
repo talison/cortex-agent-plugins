@@ -81,10 +81,11 @@ function debugLog(msg: string, ctx?: Record<string, unknown>): void {
  * provides one, else the Keychain item the other clients read
  * (`security find-generic-password -a comms-bridge -s agent-token -w`).
  *
- * Resolved once at startup — the token is stable for the process lifetime and
- * a Keychain read per request would be absurd. Absence is non-fatal: the
- * service is in report-only mode, so an unauthenticated caller still works and
- * only shows up in the service's reject log. The value is never logged.
+ * Resolved at startup and re-resolved (cooldown-limited) after any 401 —
+ * the startup read fails when the login keychain is locked (exit 36; the
+ * 2026-08-19 all-night 401 loop), and the service's auth gate is `required`,
+ * so a tokenless process is dead in the water until the token is recovered.
+ * The value is never logged.
  */
 function resolveBridgeToken(): string | undefined {
   const fromEnv = process.env.COMMS_BRIDGE_TOKEN?.trim()
@@ -109,10 +110,10 @@ function resolveBridgeToken(): string | undefined {
   return undefined
 }
 
-const BRIDGE_TOKEN = resolveBridgeToken()
+let bridgeToken = resolveBridgeToken()
 
 debugLog(
-  `startup: ppid=${process.ppid} bridge=${BRIDGE_BASE_URL} auth=${BRIDGE_TOKEN ? 'token' : 'none'}`,
+  `startup: ppid=${process.ppid} bridge=${BRIDGE_BASE_URL} auth=${bridgeToken ? 'token' : 'none'}`,
 )
 
 // Last-resort safety net — without these the process dies silently on any
@@ -130,11 +131,32 @@ const cursor = new Cursor(CURSOR_PATH)
 cursor.onReset = reason => debugLog('cursor reset to 0 — full replay ahead', { reason })
 const bridge = new BridgeClient({
   baseUrl: BRIDGE_BASE_URL,
-  token: BRIDGE_TOKEN,
+  token: bridgeToken,
 })
 
+/**
+ * A 401 means the startup token read failed (locked keychain), the token
+ * rotated, or the stored token is simply wrong. Re-read the Keychain at most
+ * once per cooldown — the poll retry loop fires every ~30s and must not
+ * hammer `security`. No-op when the re-read yields nothing new; the existing
+ * 401 retry logging keeps reporting the outage in that case.
+ */
+const TOKEN_REFRESH_COOLDOWN_MS = 60_000
+let lastTokenRefreshAt = 0
+function refreshTokenAfter401(): void {
+  const now = Date.now()
+  if (now - lastTokenRefreshAt < TOKEN_REFRESH_COOLDOWN_MS) return
+  lastTokenRefreshAt = now
+  const token = resolveBridgeToken()
+  if (token && token !== bridgeToken) {
+    bridgeToken = token
+    bridge.setToken(token)
+    debugLog('bridge token refreshed after 401 — auth restored')
+  }
+}
+
 const mcp = new Server(
-  { name: 'comms-bridge', version: '0.1.2' },
+  { name: 'comms-bridge', version: '0.1.3' },
   {
     capabilities: {
       tools: {},
@@ -279,6 +301,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
     }
   } catch (err) {
+    if (err instanceof BridgeError && err.status === 401) {
+      refreshTokenAfter401()
+    }
     const msg = err instanceof Error ? err.message : String(err)
     const detail =
       err instanceof BridgeError && err.body ? `${msg} (body: ${err.body})` : msg
@@ -396,6 +421,9 @@ void (async () => {
         // here doesn't hold up the cursor — a missed ack just leaves the
         // row in the same state pre-ack-wiring.
         void bridge.ack(msg.uuid).catch(err => {
+          if (err instanceof BridgeError && err.status === 401) {
+            refreshTokenAfter401()
+          }
           debugLog('ack failed', { uuid: msg.uuid, error: String(err) })
         })
       }
@@ -413,6 +441,9 @@ void (async () => {
       const name = err instanceof Error ? err.name : ''
       if (name === 'AbortError') return
 
+      if (err instanceof BridgeError && err.status === 401) {
+        refreshTokenAfter401()
+      }
       const detail = err instanceof Error ? err.message : String(err)
       const delay = backoff.next()
       debugLog('inbox error, retrying', {

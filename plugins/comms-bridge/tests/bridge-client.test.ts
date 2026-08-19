@@ -263,6 +263,33 @@ describe('BridgeClient bearer token', () => {
     const headers = calls[0].init?.headers as Record<string, string>
     expect(headers.authorization).toBe('Bearer sekrit')
   })
+
+  test('setToken swaps the token for subsequent requests', async () => {
+    const { calls, impl } = fakeFetch(url => okFor(url))
+    const client = new BridgeClient({ baseUrl: 'http://test', fetchImpl: impl })
+    await client.inbox('cortex', 0, 25)
+    // tokenless start (the locked-keychain case), then recovery
+    expect(calls[0].init?.headers).toBeUndefined()
+    client.setToken('  sekrit\n')
+    await client.inbox('cortex', 0, 25)
+    const headers = calls[1].init?.headers as Record<string, string>
+    expect(headers.authorization).toBe('Bearer sekrit')
+  })
+
+  test('setToken with blank/undefined drops back to unauthenticated', async () => {
+    const { calls, impl } = fakeFetch(url => okFor(url))
+    const client = new BridgeClient({
+      baseUrl: 'http://test',
+      fetchImpl: impl,
+      token: 'sekrit',
+    })
+    client.setToken(undefined)
+    await client.inbox('cortex', 0, 25)
+    expect(calls[0].init?.headers).toBeUndefined()
+    client.setToken('   ')
+    await client.inbox('cortex', 0, 25)
+    expect(calls[1].init?.headers).toBeUndefined()
+  })
 })
 
 describe('BridgeClient.baseUrl normalization', () => {
