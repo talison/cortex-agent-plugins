@@ -18,11 +18,14 @@ These are loaded from a local marketplace, not the public Anthropic registry. Fr
 /plugin install comms-bridge@cortex-agent-plugins
 ```
 
-Both plugins are channel plugins — they need to be loaded at session start with the dev-channels flag, not just installed:
+Both plugins are channel plugins — they need to be loaded at session start with the dev-channels flag, not just installed. Pass the flag **once per plugin**; a single comma-joined value does not parse and inbound messages are silently dropped:
 
 ```sh
-claude --dangerously-load-development-channels \
-  plugin:telegram@cortex-agent-plugins,plugin:comms-bridge@cortex-agent-plugins
+claude \
+  --dangerously-load-development-channels plugin:telegram@cortex-agent-plugins \
+  --dangerously-load-development-channels plugin:comms-bridge@cortex-agent-plugins
 ```
+
+Do not also pass `--channels` with the same value — the two flags collide and inbound drops.
 
 Cortex's `scripts/start-cortex.sh` already wires this up.
