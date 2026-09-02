@@ -436,6 +436,18 @@ void (async () => {
         })
       }
 
+      // The bridge says our cursor is past its MAX(id) — its DB was restored
+      // from backup or reset, so `since` points into a future that no longer
+      // exists and every poll from here would come back empty forever. Rewind
+      // to 0 and re-poll immediately. Safe because since=0 now returns UNACKED
+      // rows only: we pick up the real backlog, not 30 days of history.
+      if (res.cursor_reset) {
+        debugLog('cursor ahead of bridge table — rewinding', { cursor: cursorValue })
+        cursorValue = 0
+        cursor.write(0)
+        continue
+      }
+
       // Fast-path: when the bridge returned next_cursor without delivering
       // anything (timeout case), advance cursor anyway so we don't re-poll the
       // same window forever if cursor write was lossy.

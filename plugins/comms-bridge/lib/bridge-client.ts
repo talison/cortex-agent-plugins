@@ -25,6 +25,14 @@ export interface InboxMessage {
 export interface InboxResponse {
   messages: InboxMessage[]
   next_cursor: number
+  /**
+   * Set by the bridge when our `since` is ahead of the messages table's
+   * MAX(id) — the service's DB was restored from backup or reset, so the
+   * cursor points into a future that no longer exists and every poll would
+   * come back empty forever. Additive field: older bridge builds omit it,
+   * which reads as `undefined` and leaves the previous behaviour untouched.
+   */
+  cursor_reset?: boolean
 }
 
 export interface SendArgs {

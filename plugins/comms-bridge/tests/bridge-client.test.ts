@@ -49,6 +49,31 @@ describe('BridgeClient.inbox', () => {
     expect((caught as BridgeError).body).toBe('boom')
   })
 
+  test('surfaces cursor_reset when the bridge sets it', async () => {
+    const { impl } = fakeFetch(() =>
+      new Response(
+        JSON.stringify({ messages: [], next_cursor: 42, cursor_reset: true }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    )
+    const client = new BridgeClient({ baseUrl: 'http://test', fetchImpl: impl })
+    const out = await client.inbox('cortex', 42, 25)
+    expect(out.cursor_reset).toBe(true)
+  })
+
+  test('leaves cursor_reset undefined when the bridge omits it', async () => {
+    // Additive field — an older bridge build must keep working unchanged.
+    const { impl } = fakeFetch(() =>
+      new Response(JSON.stringify({ messages: [], next_cursor: 5 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const client = new BridgeClient({ baseUrl: 'http://test', fetchImpl: impl })
+    const out = await client.inbox('cortex', 0, 25)
+    expect(out.cursor_reset).toBeUndefined()
+  })
+
   test('returns parsed messages array', async () => {
     const payloadMessages = [
       {
