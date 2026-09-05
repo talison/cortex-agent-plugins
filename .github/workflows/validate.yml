@@ -1,0 +1,24 @@
+name: Validate plugins
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        plugin: [telegram, comms-bridge]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: plugins/${{ matrix.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run typecheck
+      - run: bun test

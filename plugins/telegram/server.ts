@@ -16,22 +16,25 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import {
   chunk,
   isMentioned,
   safeName,
-  sendText,
   setSendDiagnosticLogger,
   startTyping,
   stopTyping,
 } from './core/index.js'
+import { PermissionRequests, canReplyToPermission } from './lib/permissions.js'
+import { runPolling } from './lib/polling.js'
+import { sendReply } from './lib/reply.js'
+import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { execFileSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
-import { join, extname, sep } from 'path'
+import { join, sep } from 'path'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -352,12 +355,8 @@ function checkApprovals(): void {
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
 
-// .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
-// everything else goes as documents (raw file, no compression).
-const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
-
 const mcp = new Server(
-  { name: 'telegram', version: '1.0.0' },
+  { name: 'telegram', version: '0.1.0-fork.7' },
   {
     capabilities: {
       tools: {},
@@ -386,7 +385,7 @@ const mcp = new Server(
 )
 
 // Stores full permission details for "See more" expansion keyed by request_id.
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+const pendingPermissions = new PermissionRequests()
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
@@ -404,8 +403,9 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
-    pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
+    if (access.dmPolicy === 'disabled') return
+    pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const text = `🔐 Permission: ${tool_name}`
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${request_id}`)
@@ -501,7 +501,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         // Idempotent — safe even with no prior startTyping for this chat.
         stopTyping(chat_id)
-        const text = args.text as string
+        const text = args.text == null ? '' : args.text
+        if (typeof text !== 'string') throw new Error('text must be a string')
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const rawFormat = (args.format as string | undefined) ?? 'claude'
@@ -524,38 +525,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const sentIds: number[] = []
-
-        try {
-          const ids = await sendText(bot.api, chat_id, text, {
-            format,
-            reply_to,
-            replyToMode: replyMode,
-            chunkMode: mode,
-            chunkLimit: limit,
-          })
-          sentIds.push(...ids)
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(`reply failed after ${sentIds.length} chunk(s) sent: ${msg}`)
-        }
-
-        // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Thread under reply_to if present.
-        for (const f of files) {
-          const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          }
-        }
+        const sentIds = await sendReply(bot.api, chat_id, text, files, {
+          format,
+          reply_to,
+          replyToMode: replyMode,
+          chunkMode: mode,
+          chunkLimit: limit,
+        })
 
         const result =
           sentIds.length === 1
@@ -622,7 +598,7 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
-function shutdown(trigger: string): void {
+function shutdown(trigger: string, exitCode = 0): void {
   if (shuttingDown) return
   shuttingDown = true
   const uptime = Math.round((Date.now() - startedAt) / 1000)
@@ -633,8 +609,8 @@ function shutdown(trigger: string): void {
   } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  setTimeout(() => process.exit(exitCode), 2000)
+  void Promise.resolve(bot.stop()).finally(() => process.exit(exitCode))
 }
 process.stdin.on('end', () => shutdown('stdin:end'))
 process.stdin.on('close', () => shutdown('stdin:close'))
@@ -738,9 +714,8 @@ bot.on('callback_query:data', async ctx => {
     return
   }
   const access = loadAccess()
-  const senderId = String(ctx.from.id)
-  if (!access.allowFrom.includes(senderId)) {
-    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+  if (!canReplyToPermission(access, ctx)) {
+    await ctx.answerCallbackQuery({ text: ctx.chat ? 'Not authorized.' : 'Request no longer pending.' }).catch(() => {})
     return
   }
   const [, behavior, request_id] = m
@@ -771,11 +746,19 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  void mcp.notification({
-    method: 'notifications/claude/channel/permission',
-    params: { request_id, behavior },
-  })
-  pendingPermissions.delete(request_id)
+  let accepted: boolean
+  try {
+    accepted = await pendingPermissions.reply(request_id, behavior === 'allow' ? 'allow' : 'deny', access, ctx,
+      params => mcp.notification({ method: 'notifications/claude/channel/permission', params }))
+  } catch (error) {
+    debugLog('permission reply delivery failed', { error: String(error), request_id })
+    await ctx.answerCallbackQuery({ text: 'Delivery failed. Please try again.' }).catch(() => {})
+    return
+  }
+  if (!accepted) {
+    await ctx.answerCallbackQuery({ text: 'Request no longer pending.' }).catch(() => {})
+    return
+  }
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
   // Replace buttons with the outcome so the same request can't be answered
@@ -884,14 +867,6 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
-type AttachmentMeta = {
-  kind: string
-  file_id: string
-  size?: number
-  mime?: string
-  name?: string
-}
-
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -911,29 +886,34 @@ async function handleInbound(
   }
 
   const access = result.access
-  const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
 
-  // Permission-reply intercept: if this looks like "yes xxxxx" for a
-  // pending permission request, emit the structured event instead of
-  // relaying as chat. The sender is already gate()-approved at this point
-  // (non-allowlisted senders were dropped above), so we trust the reply.
+  // Text and buttons share the same paired-DM and pending-request checks.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
-  if (permMatch) {
-    void mcp.notification({
-      method: 'notifications/claude/channel/permission',
-      params: {
-        request_id: permMatch[2]!.toLowerCase(),
-        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
-      },
-    })
-    if (msgId != null) {
-      const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+  if (permMatch && pendingPermissions.isKnown(permMatch[2]!.toLowerCase())) {
+    const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+    let accepted: boolean
+    try {
+      accepted = await pendingPermissions.reply(
+        permMatch[2]!.toLowerCase(), behavior, access, ctx,
+        params => mcp.notification({ method: 'notifications/claude/channel/permission', params }),
+      )
+    } catch (error) {
+      debugLog('permission reply delivery failed', { error: String(error), request_id: permMatch[2] })
+      await ctx.reply('Delivery failed. Please try again.')
+      return
     }
+    if (accepted) {
+      if (msgId != null) {
+        const emoji = behavior === 'allow' ? '👍' : '👎'
+        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji }]).catch(() => {})
+      }
+    } else if (canReplyToPermission(access, ctx)) {
+      await ctx.reply('Request no longer pending.')
+    }
+    // Duplicate, stale, and unauthorized replies to known requests must not
+    // create a new assistant turn (or look like conversational approval).
     return
   }
 
@@ -966,28 +946,7 @@ async function handleInbound(
     method: 'notifications/claude/channel',
     params: {
       content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(ctx.message?.reply_to_message?.message_id != null
-          ? { reply_to_message_id: String(ctx.message.reply_to_message.message_id) }
-          : {}),
-        ...(() => {
-          const replyText = ctx.message?.reply_to_message?.text ?? ctx.message?.reply_to_message?.caption
-          return replyText != null ? { reply_to_message_text: replyText } : {}
-        })(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
+      meta: buildChannelMeta(ctx, imagePath, attachment),
     },
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
@@ -1002,51 +961,49 @@ bot.catch(err => {
   debugLog('handler error (polling continues)', { error: detail })
 })
 
-// Retry polling with backoff on any error. Previously only 409 was retried —
-// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
-// returned, and polling stopped permanently while the process stayed alive
-// (MCP stdin keeps it running). Outbound tools kept working but the bot was
-// deaf to inbound messages until a full restart.
-void (async () => {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await bot.start({
-        onStart: info => {
-          attempt = 0
-          botUsername = info.username
-          process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          debugLog('polling started', { username: info.username })
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
-        },
-      })
-      return // bot.stop() was called — clean exit from the loop
-    } catch (err) {
-      if (shuttingDown) return
-      // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
-      if (err instanceof Error && err.message === 'Aborted delay') return
-      const is409 = err instanceof GrammyError && err.error_code === 409
-      if (is409 && attempt >= 8) {
-        process.stderr.write(
-          `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
-        )
-        debugLog('polling exit: 409 persists', { attempts: attempt })
-        return
-      }
-      const delay = Math.min(1000 * attempt, 15000)
-      const detail = is409
-        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
-        : `polling error: ${err}`
+// A completed getUpdates call establishes recovery; onStart only means setup
+// finished and must not clear the retry count before polling actually works.
+let resetPollFailures = () => {}
+bot.api.config.use(async (prev, method, payload, signal) => {
+  const response = await prev(method, payload, signal)
+  if (method === 'getUpdates' && response.ok) resetPollFailures()
+  return response
+})
+
+void runPolling({
+  isShuttingDown: () => shuttingDown,
+  isConflict: error => error instanceof GrammyError && error.error_code === 409,
+  isFatal: error => error instanceof GrammyError && error.error_code === 401,
+  start: onPollSuccess => {
+    resetPollFailures = onPollSuccess
+    return bot.start({
+      onStart: info => {
+        botUsername = info.username
+        process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+        debugLog('polling started', { username: info.username })
+        void bot.api.setMyCommands(
+          [
+            { command: 'start', description: 'Welcome and setup guide' },
+            { command: 'help', description: 'What this bot can do' },
+            { command: 'status', description: 'Check your pairing status' },
+          ],
+          { scope: { type: 'all_private_chats' } },
+        ).catch(() => {})
+      },
+    })
+  },
+  onFailure: ({ error, attempt, delay, exhausted, fatal }) => {
+    const detail = String(error)
+    if (fatal) {
+      process.stderr.write('telegram channel: invalid bot token (401) — exiting.\n')
+      debugLog('polling exit: invalid bot token')
+    } else if (exhausted) {
+      process.stderr.write(`telegram channel: 409 Conflict persists after ${attempt} attempts — exiting.\n`)
+      debugLog('polling exit: 409 persists', { attempts: attempt })
+    } else {
       process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
       debugLog('polling error, retrying', { detail, attempt, delay_ms: delay })
-      await new Promise(r => setTimeout(r, delay))
     }
-  }
-})()
+  },
+  onExhausted: ({ fatal }) => shutdown(fatal ? 'polling:unauthorized' : 'polling:conflict', 1),
+})

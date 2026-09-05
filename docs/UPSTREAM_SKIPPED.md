@@ -1,12 +1,11 @@
 # Upstream decisions we skipped or deferred
 
-## Fire-once `sendChatAction('typing')` in `handleInbound`
+## Typing indicators
 
-**Phase 2 decision (2026-04-17):** Leave as-is.
-
-Shared-core offers `withTyping(api, chat_id, fn)` which keeps a typing indicator refreshed every ~4s. The plugin's MCP server has no roundtrip signal from Claude for "I'm done processing this turn," so we cannot bound the `fn` body sensibly. The fire-once call relies on Telegram's natural ~5s typing expiry, which is usually adequate for short tool replies.
-
-Revisit if/when the MCP protocol gains a turn-completion signal.
+The earlier fire-once decision is superseded. The plugin now calls
+`startTyping` on inbound messages, stops on the reply tool, and applies a
+three-minute safety cap. `withTyping` remains appropriate for callers that
+own the entire request/response lifetime.
 
 ## `edit_message` tool still uses legacy `format: 'markdownv2'`
 

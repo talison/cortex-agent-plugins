@@ -26,19 +26,21 @@ The bridge service lives in [`talison/cortex/comms-bridge/`](https://github.com/
 
 ### Auth
 
-The service gates `/send`, `/inbox` and `/ack` behind `Authorization: Bearer <token>`. The plugin resolves the token once at startup: `COMMS_BRIDGE_TOKEN` if the environment sets it, otherwise the Keychain item the service's other clients read —
+The service gates `/send`, `/inbox` and `/ack` behind `Authorization: Bearer <token>`. The plugin resolves the token at startup and retries resolution after a 401 (at most once per minute): `COMMS_BRIDGE_TOKEN` if the environment sets it, otherwise the Keychain item the service's other clients read —
 
 ```sh
 security find-generic-password -a comms-bridge -s agent-token -w
 ```
 
-No token found is non-fatal (one line in the debug log, requests go out unauthenticated) — correct while the service runs in `report-only` mode, a 401 once it flips to `required`. The token value is never logged.
+No token found is non-fatal: requests go out unauthenticated and receive a 401 from the service, which requires authentication. The retry loop can recover when the Keychain becomes available. The token value is never logged.
 
 Plugin debug log: `~/.claude/channels/comms-bridge/logs/fork-debug.log`.
 
 ## Tests
 
 ```sh
+bun install --frozen-lockfile --ignore-scripts
+bun run typecheck
 bun test
 ```
 
@@ -52,7 +54,7 @@ plugins/comms-bridge/
 ├── .mcp.json                     # MCP server config: bun run start
 ├── server.ts                     # main entry: long-poll loop + MCP send tool
 ├── lib/                          # bridge-client, cursor, payload, backoff
-├── tests/                        # vitest specs for each lib module
+├── tests/                        # Bun unit and server integration tests
 └── package.json                  # bun deps
 ```
 

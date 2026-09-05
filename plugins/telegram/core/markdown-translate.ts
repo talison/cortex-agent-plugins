@@ -10,6 +10,44 @@ const V2_URL_ESCAPE = /[\\)]/g;
 
 type PlaceholderEntry = { key: string; content: string };
 
+// Share the recognized regions with the chunk-boundary check. Raw underscores
+// in identifiers and list bullets are not emphasis in this translator.
+const FENCE_RE = /```[^\n]*\n[\s\S]*?\n```/g;
+const INLINE_CODE_RE = /`([^`\n]+)`/g;
+const LINK_RE = /\[([^\]\n]+)\]\(([^)\n]+)\)/g;
+const HEADING_RE = /^(#{1,6})\s+(.+)$/gm;
+const DOUBLE_STRIKE_RE = /~~([^~\n]+?)~~/g;
+const SINGLE_STRIKE_RE = /(?<!\w)~(?=\S)([^~\n]+?)(?<=\S)~(?!\w)/g;
+const BOLD_RE = /\*\*([^\n]+?)\*\*/g;
+const ITALIC_STAR_RE = /(?<!\w)\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\w)/g;
+const ITALIC_UNDER_RE = /(?<!\w)_([^_\n]+?)_(?!\w)/g;
+
+/** Chunks intersecting a recognized Markdown region split by a boundary. */
+export function spanningMarkdownChunks(chunks: string[]): Set<number> {
+  const affected = new Set<number>();
+  if (chunks.length < 2) return affected;
+  let offset = 0;
+  const ends = chunks.map(part => (offset += part.length));
+  let residue = chunks.join('');
+  for (const pattern of [FENCE_RE, INLINE_CODE_RE, LINK_RE, HEADING_RE,
+    DOUBLE_STRIKE_RE, SINGLE_STRIKE_RE, BOLD_RE, ITALIC_STAR_RE, ITALIC_UNDER_RE]) {
+    residue = residue.replace(pattern, (...args: unknown[]) => {
+      const matched = args[0] as string;
+      const start = args[args.length - 2] as number;
+      const first = ends.findIndex(end => end > start);
+      const last = ends.findIndex(end => end >= start + matched.length);
+      if (first < last) {
+        for (let i = first; i <= last; i++) affected.add(i);
+      }
+      // Shield contents using non-space, non-word placeholders, just like the
+      // translator, so emphasis around inline code still matches. Retain
+      // offsets and line boundaries for the original source chunks.
+      return matched.replace(/[^\n]/g, '\u0000');
+    });
+  }
+  return affected;
+}
+
 /**
  * Convert Claude-native Markdown (standard CommonMark-ish syntax) to Telegram
  * MarkdownV2 with correct escaping.
@@ -45,14 +83,14 @@ export function claudeToTelegramV2(text: string): string {
 
   // 1a. Fenced code blocks (must precede inline-code extraction so the
   //     fence's own backticks aren't picked up as inline code).
-  text = text.replace(/```[^\n]*\n[\s\S]*?\n```/g, (m) => makePh(m));
+  text = text.replace(FENCE_RE, (m) => makePh(m));
 
   // 1b. Inline code.
-  text = text.replace(/`([^`\n]+)`/g, (m) => makePh(m));
+  text = text.replace(INLINE_CODE_RE, (m) => makePh(m));
 
   // 1c. Links [text](url). Per v2 spec: link text escapes the full reserved
   //     set; URL escapes only `)` and `\`.
-  text = text.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_m, linkText, url) => {
+  text = text.replace(LINK_RE, (_m, linkText, url) => {
     const escText = linkText.replace(V2_RESERVED, '\\$&');
     const escUrl = url.replace(V2_URL_ESCAPE, '\\$&');
     return makePh(`[${escText}](${escUrl})`);
@@ -66,13 +104,13 @@ export function claudeToTelegramV2(text: string): string {
   // ---- Pass 2: transform Markdown constructs ------------------------------
 
   // 2a. Headings — line-anchored, multiline. Inner text still needs escaping.
-  text = text.replace(/^(#{1,6})\s+(.+)$/gm, (_m, _hashes, inner) => {
+  text = text.replace(HEADING_RE, (_m, _hashes, inner) => {
     const escInner = inner.replace(V2_RESERVED, '\\$&');
     return makePh(`*${escInner}*`);
   });
 
   // 2b. Strikethrough (double tilde) — before single-tilde strike (~~ contains ~).
-  text = text.replace(/~~([^~\n]+?)~~/g, (_m, inner) => {
+  text = text.replace(DOUBLE_STRIKE_RE, (_m, inner) => {
     const escInner = inner.replace(V2_RESERVED, '\\$&');
     return makePh(`~${escInner}~`);
   });
@@ -80,7 +118,7 @@ export function claudeToTelegramV2(text: string): string {
   // 2c. Single-tilde strikethrough. Word-boundary lookarounds avoid matching
   //     `~tilde_in~word`, and the (?=\S)/(?<=\S) guards avoid `~ spaced ~`.
   text = text.replace(
-    /(?<!\w)~(?=\S)([^~\n]+?)(?<=\S)~(?!\w)/g,
+    SINGLE_STRIKE_RE,
     (_m, inner) => {
       const escInner = inner.replace(V2_RESERVED, '\\$&');
       return makePh(`~${escInner}~`);
@@ -90,9 +128,7 @@ export function claudeToTelegramV2(text: string): string {
   // 2d. Bold (double asterisk) — accepts single `*` chars inside so a bold
   //     phrase containing `*italic*` still matches the outer bold. Inner italics
   //     are transformed recursively before reserved-char escaping.
-  const ITALIC_STAR_RE = /(?<!\w)\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\w)/g;
-  const ITALIC_UNDER_RE = /(?<!\w)_([^_\n]+?)_(?!\w)/g;
-  text = text.replace(/\*\*([^\n]+?)\*\*/g, (_m, inner: string) => {
+  text = text.replace(BOLD_RE, (_m, inner: string) => {
     // Transform nested italics first so they survive the outer escape.
     let transformed = inner
       .replace(ITALIC_STAR_RE, (_m2: string, it: string) => {

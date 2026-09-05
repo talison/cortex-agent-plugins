@@ -14,6 +14,7 @@ export {
   sendText,
   editText,
   setSendDiagnosticLogger,
+  PartialSendError,
   type MarkdownFormat,
   type SendTextOpts,
 } from './send.js';

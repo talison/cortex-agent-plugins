@@ -1,25 +1,6 @@
 import { test, expect } from "bun:test"
 
-// Pure helper mirroring the meta-block construction in server.ts handleInbound.
-// MUST stay in sync with the inlined version in server.ts — when adding fields
-// in production, add them here too. The live notification path itself is
-// exercised via the post-fork-publish manual smoke test.
-function buildChannelMeta(ctx: any, imagePath?: string): Record<string, any> {
-  const chat_id = String(ctx.chat.id)
-  const msgId = ctx.message?.message_id
-  const from = ctx.from
-  const replyTo = ctx.message?.reply_to_message
-  return {
-    chat_id,
-    ...(msgId != null ? { message_id: String(msgId) } : {}),
-    user: from.username ?? String(from.id),
-    user_id: String(from.id),
-    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-    ...(replyTo?.message_id != null ? { reply_to_message_id: String(replyTo.message_id) } : {}),
-    ...((replyTo?.text ?? replyTo?.caption) != null ? { reply_to_message_text: replyTo.text ?? replyTo.caption } : {}),
-    ...(imagePath ? { image_path: imagePath } : {}),
-  }
-}
+import { buildChannelMeta } from "../lib/channel-meta.ts"
 
 test("channel meta includes reply_to_message_id when reply_to_message present", () => {
   const ctx = {

@@ -162,7 +162,7 @@ function refreshTokenAfter401(): void {
 }
 
 const mcp = new Server(
-  { name: 'comms-bridge', version: '0.1.4' },
+  { name: 'comms-bridge', version: '0.1.5' },
   {
     capabilities: {
       tools: {},
@@ -350,12 +350,10 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGHUP', () => shutdown('SIGHUP'))
 
-// Orphan watchdog — stdin events don't reliably fire if the parent chain is
-// severed by a crash. Same pattern as telegram fork.
-const bootPpid = process.ppid
+// Match Telegram: wrapper exit/reparenting does not mean the MCP connection
+// closed. The inherited stdin pipe is the authoritative lifecycle signal.
 setInterval(() => {
   const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
     process.stdin.destroyed ||
     process.stdin.readableEnded
   if (orphaned) shutdown('watchdog:orphan')

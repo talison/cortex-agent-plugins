@@ -4,28 +4,28 @@ Deferred items from the 2026-06-09 plugin review (full context: cortex repo
 history + Cortex/Reference/comms-bridge.md). Each was judged real but not
 worth its rollout cost at review time.
 
-## telegram-core (fix in harness first, then `scripts/sync-telegram-core.sh`)
+## Resolved in the audit fixes
 
-- **Wrap `claudeToTelegramV2` in try/catch** (core/send.ts:99) — a translator
-  throw currently fails the whole send with a visible tool error; falling back
-  to plain text (same philosophy as the parse-entities fallback) would deliver
-  the message instead. Low probability (pure string code, 6+ weeks in prod
-  across both consumers), so deferred — requires harness edit + core sync +
-  fork version bump + Max container rebuild.
-- **Chunk-boundary mismatch** (core/send.ts:100-121) — `preparedChunks` /
-  `originalChunks` can differ in count when MarkdownV2 escaping inflates text
-  across the 4096 boundary; the `?? preparedChunks[i]` fallback then passes
-  already-escaped text as the "original" plain-text retry. Cosmetic worst case
-  (escape noise in one chunk), needs a fix in chunk alignment, same rollout
-  chain as above.
+- Source-first chunking keeps translated text and plain fallback aligned.
+  The former mismatch could lose and duplicate content, not just add escape
+  noise. Translation errors now also fall back to the original source chunk.
+- Partial-send errors preserve confirmed message IDs, including file sends.
+- Permission replies require a paired DM, an enabled policy, and a pending
+  request. Concurrent text/button replies cannot emit duplicate approvals.
+- Telegram resets retry counts only after a successful poll. The bridge
+  watchdog uses stdin state so normal wrapper reparenting does not stop it.
+- CI runs tests and pinned TypeScript checks on macOS and Linux.
+
+The shared-core delivery fixes are currently fork-local; see `UPSTREAM.md`
+before syncing from harness.
 
 ## telegram plugin (fork-local)
 
 - **MCP notification failure handling** (server.ts inbound path) — inbound
   delivery is a fire-and-forget `mcp.notification()` with `.catch` →
-  fork-debug.log. A retry-once would tighten it, but the failure mode has
+  stderr. A retry-once would tighten it, but the failure mode has
   never been observed and duplicate-delivery semantics of a blind retry are
-  unclear. Revisit if `notification failed` ever shows up in the debug log.
+  unclear. Revisit if `failed to deliver inbound to Claude` appears on stderr.
 - **`pendingPermissions` Map has no TTL** — unbounded only in theory
   (single operator, rare permission prompts). Revisit if permission volume
   ever changes.

@@ -19,6 +19,9 @@ interface Booted {
   /** `since` query param of each GET /inbox, in arrival order. */
   sinceParams: number[]
   cursorFile: string
+  logFile: string
+  exitCode: () => number | null
+  closeInput: () => Promise<number>
   stop: () => void
 }
 
@@ -33,6 +36,7 @@ async function bootAgainstBridge(
   startCursor: number,
   firstResponse: Record<string, unknown>,
   awaitPolls: number,
+  simulateReparent = false,
 ): Promise<Booted> {
   const dir = mkdtempSync(join(tmpdir(), 'comms-bridge-test-'))
   const cursorFile = join(dir, 'cursor')
@@ -68,7 +72,16 @@ async function bootAgainstBridge(
     },
   })
 
-  const proc = Bun.spawn(['bun', SERVER], {
+  const preload = join(dir, 'reparent.ts')
+  if (simulateReparent) {
+    // Exercise the real watchdog with live MCP stdin while the parent PID
+    // changes, as it does when a launcher wrapper exits normally.
+    writeFileSync(preload, `const original = process.ppid;
+Object.defineProperty(process, 'ppid', { configurable: true, get: () => original });
+setTimeout(() => Object.defineProperty(process, 'ppid', { get: () => 1 }), 100);
+`)
+  }
+  const proc = Bun.spawn(['bun', ...(simulateReparent ? ['--preload', preload] : []), SERVER], {
     env: {
       ...process.env,
       COMMS_BRIDGE_URL: `http://127.0.0.1:${bridge.port}`,
@@ -99,8 +112,11 @@ async function bootAgainstBridge(
   return {
     sinceParams,
     cursorFile,
+    logFile: join(dir, 'state', 'logs', 'fork-debug.log'),
+    exitCode: () => proc.exitCode,
+    closeInput: () => { proc.stdin.end(); return proc.exited },
     stop: () => {
-      proc.kill()
+      if (proc.exitCode == null) proc.kill()
       bridge.stop(true)
       rmSync(dir, { recursive: true, force: true })
     },
@@ -142,3 +158,21 @@ describe('poll loop: cursor_reset', () => {
     expect(readFileSync(booted.cursorFile, 'utf8').trim()).toBe('77')
   }, 15_000)
 })
+
+
+test('wrapper reparenting with open stdin does not stop the real poll loop', async () => {
+  booted = await bootAgainstBridge(0, { messages: [], next_cursor: 0 }, 2, true)
+  await Bun.sleep(5500) // cross the production watchdog's five-second interval
+  const polls = booted.sinceParams.length
+  await Bun.sleep(500)
+  expect(booted.sinceParams.length).toBeGreaterThan(polls)
+  expect(booted.exitCode()).toBeNull()
+  expect(readFileSync(booted.logFile, 'utf8')).not.toContain('watchdog:orphan')
+}, 15_000)
+
+
+test('closing MCP stdin shuts down the real bridge process', async () => {
+  booted = await bootAgainstBridge(0, { messages: [], next_cursor: 0 }, 2)
+  expect(await booted.closeInput()).toBe(0)
+  expect(readFileSync(booted.logFile, 'utf8')).toContain('shutdown trigger=stdin:')
+}, 15_000)

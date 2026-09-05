@@ -26,7 +26,8 @@ export function chunk(text: string, limit: number, mode: ChunkMode): string[] {
               : limit;
     }
     out.push(rest.slice(0, cut));
-    rest = rest.slice(cut).replace(/^\s+/, '');
+    // Keep source whitespace: it may be indentation inside a code block.
+    rest = rest.slice(cut);
   }
   if (rest) out.push(rest);
   return out;

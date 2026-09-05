@@ -26,7 +26,7 @@ These are Claude Code commands — run `claude` to start a session first.
 
 Install the plugin:
 ```
-/plugin install telegram@claude-plugins-official
+/plugin install telegram@cortex-agent-plugins
 /reload-plugins
 ```
 
@@ -45,12 +45,12 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can a
 The server won't connect without this — exit your session and start a new one:
 
 ```sh
-claude --channels plugin:telegram@claude-plugins-official
+claude --dangerously-load-development-channels plugin:telegram@cortex-agent-plugins
 ```
 
 **5. Pair.**
 
-With Claude Code running from the previous step, DM your bot on Telegram — it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In your Claude Code session:
+With Claude Code running from the previous step, DM your bot on Telegram — it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--dangerously-load-development-channels`. In your Claude Code session:
 
 ```
 /telegram:access pair <code>
@@ -94,6 +94,32 @@ Telegram's Bot API exposes **neither** message history nor search. The bot
 only sees messages as they arrive — no `fetch_messages` tool exists. If the
 assistant needs earlier context, it will ask you to paste or summarize.
 
-This also means there's no `download_attachment` tool for historical messages
-— photos are downloaded eagerly on arrival since there's no way to fetch them
-later.
+The `download_attachment` tool fetches a file using an `attachment_file_id` from
+an inbound notification. It cannot search for historical messages. Photos are
+downloaded eagerly after access checks.
+
+
+## Development checks
+
+Run `bun install --frozen-lockfile --ignore-scripts`, `bun run typecheck`, and
+`bun test` from this directory. Tests exercise production metadata, permission,
+polling, and delivery code with mocked transports; no Telegram credentials are
+needed. CI runs both plugins on macOS and Linux.
+
+Long replies are split before Markdown translation. The configured limit applies
+to source text. Telegram's [4096-character limit](https://core.telegram.org/bots/api#sendmessage)
+is measured after entity parsing, so added escape characters do not consume the
+limit. Only chunks intersecting a Markdown region split by a boundary are sent
+plainly; unrelated chunks retain formatting. Parse errors fall back to the exact
+source chunk. A partial-send error lists confirmed message IDs so a retry can
+avoid duplicating delivered parts.
+
+
+After eight consecutive polling conflicts (HTTP 409), the plugin shuts down
+its MCP server as well as polling, with a nonzero exit status. This intentionally replaces the former
+state where tools remained available while inbound polling had stopped.
+Resolve the competing bot poller and restart the session to restore the channel.
+
+An invalid bot token (HTTP 401) also terminates the process with a nonzero status;
+update the token and restart the session instead of retrying a fixed credential
+indefinitely.

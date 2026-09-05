@@ -1,6 +1,6 @@
 import type { Api } from 'grammy';
 import { chunk, type ChunkMode } from './chunk.js';
-import { claudeToTelegramV2 } from './markdown-translate.js';
+import { claudeToTelegramV2, spanningMarkdownChunks } from './markdown-translate.js';
 import { isParseEntitiesError } from './markdown.js';
 
 // Optional diagnostic logger — set by the host at boot. When present, we log
@@ -27,6 +27,13 @@ export interface SendTextOpts {
 
 const MAX_429_RETRIES = 3;
 
+export class PartialSendError extends Error {
+  constructor(public readonly sentIds: number[], cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'PartialSendError';
+  }
+}
+
 async function sendOneChunk(
   api: Pick<Api, 'sendMessage'>,
   chat_id: string | number,
@@ -50,10 +57,9 @@ async function sendOneChunk(
           preparedPreview: preparedText.slice(0, 300),
           originalPreview: originalText.slice(0, 300),
         });
-        const res: any = await api.sendMessage(chat_id, originalText, {
-          ...extra,
-        });
-        return res.message_id;
+        preparedText = originalText;
+        parseMode = undefined;
+        continue; // Plain retries must retain the same 429 handling.
       }
       const retryAfter = (err as any)?.parameters?.retry_after;
       if (retryAfter != null && attempt < MAX_429_RETRIES) {
@@ -94,35 +100,54 @@ export async function sendText(
   const format = opts.format ?? 'text';
   const replyToMode = opts.replyToMode ?? 'first';
   const chunkMode = opts.chunkMode ?? 'newline';
-  const chunkLimit = opts.chunkLimit ?? 4096;
+  const chunkLimit = Math.min(opts.chunkLimit ?? 4096, 4096);
+  if (!Number.isInteger(chunkLimit) || chunkLimit < 1) {
+    throw new Error('chunkLimit must be a positive integer');
+  }
 
-  const prepared = format === 'claude' ? claudeToTelegramV2(text) : text;
-  const preparedChunks = chunk(prepared, chunkLimit, chunkMode);
   const originalChunks = chunk(text, chunkLimit, chunkMode);
-
-  const parseMode: 'MarkdownV2' | undefined =
-    format === 'claude' ? 'MarkdownV2' : undefined;
+  // Independent translation loses context inside a spanning fence, link, or
+  // emphasis region. Send affected chunks plainly, preserving literal code and
+  // source markers instead of interpreting code fragments as prose Markdown.
+  const plainChunks = format === 'claude' ? spanningMarkdownChunks(originalChunks) : new Set<number>();
   const threadId = opts.message_thread_id;
 
   const ids: number[] = [];
-  for (let i = 0; i < preparedChunks.length; i++) {
+  for (let i = 0; i < originalChunks.length; i++) {
+    const original = originalChunks[i]!;
+    // Telegram rejects messages containing only whitespace. This can be a
+    // trailing newline just past a boundary, even when the reply has content.
+    if (!original.trim()) continue;
+    let prepared = original;
+    let parseMode: 'MarkdownV2' | undefined;
+    if (format === 'claude' && !plainChunks.has(i)) {
+      try {
+        // Telegram's 4096 limit applies after entity parsing, not to the
+        // escaped payload. Source chunks already fit that bound, and this
+        // translator never adds visible characters.
+        // https://core.telegram.org/bots/api#sendmessage
+        prepared = claudeToTelegramV2(original);
+        parseMode = 'MarkdownV2';
+      } catch (error) {
+        diagLog?.('Telegram translation failed; sending plain text', {
+          error: String(error), chat_id,
+        });
+      }
+    }
     const shouldReplyTo =
       opts.reply_to != null &&
       replyToMode !== 'off' &&
-      (replyToMode === 'all' || i === 0);
+      (replyToMode === 'all' || ids.length === 0);
     const extra: Record<string, unknown> = {};
     if (shouldReplyTo) extra.reply_parameters = { message_id: opts.reply_to };
     if (threadId != null) extra.message_thread_id = threadId;
 
-    const id = await sendOneChunk(
-      api,
-      chat_id,
-      preparedChunks[i]!,
-      originalChunks[i] ?? preparedChunks[i]!,
-      parseMode,
-      extra,
-    );
-    ids.push(id);
+    try {
+      const id = await sendOneChunk(api, chat_id, prepared, original, parseMode, extra);
+      ids.push(id);
+    } catch (error) {
+      throw new PartialSendError([...ids], error);
+    }
   }
   return ids;
 }

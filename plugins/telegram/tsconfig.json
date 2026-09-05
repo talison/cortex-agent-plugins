@@ -3,7 +3,9 @@
     "target": "esnext",
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
@@ -11,5 +13,9 @@
     "esModuleInterop": true,
     "resolveJsonModule": true
   },
-  "include": ["server.ts", "core/**/*.ts"]
+  "include": [
+    "server.ts",
+    "core/**/*.ts",
+    "lib/**/*.ts"
+  ]
 }
