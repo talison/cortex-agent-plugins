@@ -191,7 +191,7 @@ describe('BridgeClient.send', () => {
 })
 
 describe('BridgeClient.ack', () => {
-  test('POSTs the uuid', async () => {
+  test('POSTs the uuid and the acking agent', async () => {
     const { calls, impl } = fakeFetch(() =>
       new Response(JSON.stringify({ ok: true, updated: true }), {
         status: 200,
@@ -199,11 +199,11 @@ describe('BridgeClient.ack', () => {
       }),
     )
     const client = new BridgeClient({ baseUrl: 'http://test', fetchImpl: impl })
-    const out = await client.ack('u9')
+    const out = await client.ack('u9', 'cortex')
     expect(out.ok).toBe(true)
     expect(out.updated).toBe(true)
     const body = JSON.parse(calls[0].init?.body as string)
-    expect(body).toEqual({ uuid: 'u9' })
+    expect(body).toEqual({ uuid: 'u9', agent: 'cortex' })
   })
 })
 
@@ -245,7 +245,7 @@ describe('BridgeClient bearer token', () => {
       kind: 'notify',
       payload: 'hi',
     })
-    await client.ack('u1')
+    await client.ack('u1', 'cortex')
     expect(calls).toHaveLength(3)
     return calls
   }

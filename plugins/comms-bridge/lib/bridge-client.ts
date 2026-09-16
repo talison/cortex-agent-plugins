@@ -162,11 +162,12 @@ export class BridgeClient {
     return (await res.json()) as SendResponse
   }
 
-  async ack(uuid: string): Promise<{ ok: boolean; updated: boolean }> {
+  /** Ack as `agent`: the bridge only marks a row addressed to that agent. */
+  async ack(uuid: string, agent: string): Promise<{ ok: boolean; updated: boolean }> {
     const res = await this.fetchImpl(`${this.baseUrl}/ack`, {
       method: 'POST',
       headers: this.headers({ 'content-type': 'application/json' }),
-      body: JSON.stringify({ uuid }),
+      body: JSON.stringify({ uuid, agent }),
     })
     if (!res.ok) {
       const body = await safeText(res)
