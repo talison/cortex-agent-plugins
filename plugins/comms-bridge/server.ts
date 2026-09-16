@@ -426,7 +426,7 @@ void (async () => {
         // Fire-and-forget ack so the bridge can mark the row acked. Failure
         // here doesn't hold up the cursor — a missed ack just leaves the
         // row in the same state pre-ack-wiring.
-        void bridge.ack(msg.uuid).catch(err => {
+        void bridge.ack(msg.uuid, AGENT).catch(err => {
           if (err instanceof BridgeError && err.status === 401) {
             refreshTokenAfter401()
           }
