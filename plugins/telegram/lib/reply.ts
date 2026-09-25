@@ -9,8 +9,8 @@ const MAX_CHUNK_LIMIT = 4096
 /**
  * Chunking for replies from access.json. `newline` is the default, as in
  * harness's telegram-core: a chunk beside a cut inside a line goes out plain,
- * and `length` mode cuts inside lines almost every time. Newline mode still
- * hard-cuts a single line longer than the limit.
+ * and `length` mode cuts inside lines almost every time. Newline mode cuts
+ * at a break in the second half of the limit, else at the limit itself.
  */
 export function replyChunking(access: { textChunkLimit?: number; chunkMode?: ChunkMode }): {
   chunkMode: ChunkMode

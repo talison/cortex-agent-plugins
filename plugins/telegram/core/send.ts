@@ -33,7 +33,8 @@ export interface SendTextOpts {
   message_thread_id?: number;
   /**
    * First chunk to send, from an earlier `onChunkSent`. Valid only under the
-   * same `CHUNK_PLAN_VERSION`; past the last chunk it is an error.
+   * same `CHUNK_PLAN_VERSION`. The chunk count (the checkpoint after the last
+   * chunk) sends nothing: the text was delivered. Beyond it is an error.
    */
   startChunk?: number;
   /**
@@ -216,13 +217,10 @@ export async function sendText(
 
   const plan = planChunks(text, format, chunkLimit, chunkMode, chat_id);
   const start = opts.startChunk ?? 0;
-  // Resuming past the end would send nothing and report success, and the
-  // caller would discard what may be an undelivered message.
-  if (
-    !Number.isInteger(start) ||
-    start < 0 ||
-    (start > 0 && start >= plan.length)
-  ) {
+  // start === plan.length is the final checkpoint: nothing left to send.
+  // Beyond it, the index belongs to some other text or plan; succeeding
+  // would let the caller discard what may be an undelivered message.
+  if (!Number.isInteger(start) || start < 0 || start > plan.length) {
     throw new Error(
       `invalid startChunk ${start} for a text of ${plan.length} chunk(s)`,
     );

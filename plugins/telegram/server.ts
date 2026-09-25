@@ -140,7 +140,7 @@ type Access = {
   replyToMode?: 'off' | 'first' | 'all'
   /** Max chars per outbound message before splitting. Default: 4096 (Telegram's hard cap). */
   textChunkLimit?: number
-  /** 'newline' (default) prefers paragraph, then line boundaries; 'length' cuts at the limit. */
+  /** 'newline' (default): last paragraph, line or space break past half the limit, else the limit. 'length': the limit. */
   chunkMode?: 'length' | 'newline'
 }
 

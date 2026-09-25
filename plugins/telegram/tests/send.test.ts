@@ -382,9 +382,28 @@ test('a cut at a newline keeps line-start Markdown', async () => {
 
 test('a startChunk past the last chunk is an error, not an empty success', async () => {
   const { api, attempts } = recordingApi()
-  await expect(sendText(api, '1', 'a.'.repeat(1500), { format: 'claude', startChunk: 1 }))
-    .rejects.toThrow('startChunk 1')
+  await expect(sendText(api, '1', 'a.'.repeat(1500), { format: 'claude', startChunk: 2 }))
+    .rejects.toThrow('startChunk 2')
   expect(attempts).toHaveLength(0)
+})
+
+test('a retry from the final text checkpoint goes straight to the attachments', async () => {
+  // onChunkSent reports the chunk count after the last chunk. The text went
+  // out and the upload failed; resuming there must not fail on the text.
+  const api = fakeAPI(async () => ({ message_id: 42 }))
+  let uploads = 0
+  api.sendDocument = async () => {
+    if (uploads++ === 0) throw new Error('upload failed')
+    return { message_id: 43 }
+  }
+  let checkpoint = 0
+  await expect(sendReply(api, '1', 'hello', ['/tmp/a.txt'], { onChunkSent: next => { checkpoint = next } }))
+    .rejects.toThrow('1 part(s) sent (ids: 42)')
+  expect(checkpoint).toBe(1)
+  let texts = 0
+  api.sendMessage = async () => ({ message_id: 40 + ++texts })
+  expect(await sendReply(api, '1', 'hello', ['/tmp/a.txt'], { startChunk: checkpoint })).toEqual([43])
+  expect(texts).toBe(0)
 })
 
 test('a throwing onChunkSent keeps the confirmed ID', async () => {

@@ -90,7 +90,7 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 
 **`textChunkLimit`** sets the split threshold. Telegram rejects messages over 4096 characters.
 
-**`chunkMode`** chooses the split strategy: `newline` (default) prefers paragraph, then line boundaries, and hard-cuts only a single line longer than the limit; `length` cuts exactly at the limit. A chunk beside a cut inside a line is sent without formatting, so `length` mode usually sends multi-part replies plain.
+**`chunkMode`** chooses the split strategy. `newline` (default) cuts at the last paragraph break before the limit, else the last line break, else the last space, but only a break in the second half of the limit counts; with none there, it cuts at the limit. `length` always cuts at the limit. A chunk beside a cut inside a line (at a space or at the limit) is sent without formatting. `length` mode therefore usually sends multi-part replies plain. `newline` mode keeps them formatted when line breaks fall in each chunk's second half. A long line or block with no break there still splits mid-line: `**intro**\n` followed by 4,090 characters with no break cuts at 4,096 and sends both parts plain.
 
 ## Skill reference
 

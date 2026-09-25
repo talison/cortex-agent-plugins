@@ -112,9 +112,11 @@ is measured after entity parsing, so added escape characters do not consume the
 limit. Chunks intersecting a Markdown region split by a boundary are sent
 plainly, as are both chunks beside a cut inside a line: alone, text at that
 edge could read as italics, a heading, or a quote. A cut at a newline keeps
-formatting. The default `newline` chunk mode cuts at paragraph or line
-boundaries, so multi-part replies stay formatted; an explicit `length` mode
-cuts at exactly the limit and usually sends them plain. Parse errors fall back to the exact source chunk. A partial-send
+formatting. The default `newline` chunk mode cuts at a paragraph break, a
+line break, or a space in the second half of the limit, so replies with
+ordinary line lengths stay formatted; a longer run without a break still cuts
+mid-line (see `chunkMode` in ACCESS.md). An explicit `length` mode cuts at
+exactly the limit and usually sends multi-part replies plain. Parse errors fall back to the exact source chunk. A partial-send
 error lists confirmed message IDs, including one confirmed just before a
 failing `onChunkSent`, so a retry can avoid duplicating delivered parts.
 
