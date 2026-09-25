@@ -1,6 +1,9 @@
 import type { Api } from 'grammy';
 import { chunk, type ChunkMode } from './chunk.js';
-import { claudeToTelegramV2, spanningMarkdownChunks } from './markdown-translate.js';
+import {
+  claudeToTelegramV2,
+  spanningMarkdownChunks,
+} from './markdown-translate.js';
 import { isParseEntitiesError } from './markdown.js';
 
 // Optional diagnostic logger — set by the host at boot. When present, we log
@@ -21,11 +24,21 @@ export interface SendTextOpts {
   reply_to?: number;
   replyToMode?: 'off' | 'first' | 'all';
   chunkMode?: ChunkMode;
+  /**
+   * Source characters per message, at most 4096 (the default). Escapes may
+   * lengthen a MarkdownV2 payload past it; Telegram counts the limit after
+   * entity parsing, so that is fine.
+   */
   chunkLimit?: number;
   message_thread_id?: number;
+  startChunk?: number;
+  onChunkSent?: (nextChunk: number) => void;
 }
 
 const MAX_429_RETRIES = 3;
+
+/** Telegram's sendMessage text limit. https://core.telegram.org/bots/api#sendmessage */
+const TELEGRAM_TEXT_LIMIT = 4096;
 
 export class PartialSendError extends Error {
   constructor(public readonly sentIds: number[], cause: unknown) {
@@ -59,7 +72,7 @@ async function sendOneChunk(
         });
         preparedText = originalText;
         parseMode = undefined;
-        continue; // Plain retries must retain the same 429 handling.
+        continue; // The plain retry keeps the same 429 handling.
       }
       const retryAfter = (err as any)?.parameters?.retry_after;
       if (retryAfter != null && attempt < MAX_429_RETRIES) {
@@ -85,11 +98,66 @@ async function sendOneChunk(
   }
 }
 
+/** One message: its exact source slice, and its MarkdownV2 form if formatted. */
+interface PlannedChunk {
+  source: string;
+  markdownV2?: string;
+}
+
 /**
- * Send `text` as one or more Telegram messages. When `format:'claude'`, the
- * text is translated to MarkdownV2 before sending and falls back to the
- * original (no parse_mode) on a parse-entities error. 429s are retried up to
- * MAX_429_RETRIES times, respecting `retry_after`.
+ * The messages `sendText` delivers for `text`. The source is chunked first and
+ * each chunk translated on its own, so a parse-error fallback sends exactly
+ * the text its failed payload encoded. The plan depends only on its inputs:
+ * `startChunk` indexes into it, so a resumed send continues on the same
+ * boundaries.
+ *
+ * No chunk is split again when escaping lengthens its payload past 4096.
+ * Telegram counts that limit after entity parsing, and translation adds only
+ * escapes and entity markers, never visible characters, so a source chunk
+ * within 4096 always fits. A re-split would only add messages.
+ * https://core.telegram.org/bots/api#sendmessage
+ */
+function planChunks(
+  text: string,
+  format: MarkdownFormat,
+  limit: number,
+  mode: ChunkMode,
+  chat_id: string | number,
+): PlannedChunk[] {
+  const sources = chunk(text, limit, mode);
+  // Independent translation loses context inside a spanning fence, link, or
+  // emphasis region. Send affected chunks plainly, preserving literal code
+  // and source markers instead of interpreting code fragments as prose.
+  const plain =
+    format === 'claude' ? spanningMarkdownChunks(sources) : undefined;
+  const plan: PlannedChunk[] = [];
+  sources.forEach((source, i) => {
+    // Telegram rejects whitespace-only text. A cut can leave a trailing
+    // newline on its own, even when the reply has content.
+    if (!source.trim()) return;
+    if (!plain || plain.has(i)) {
+      plan.push({ source });
+      return;
+    }
+    try {
+      plan.push({ source, markdownV2: claudeToTelegramV2(source) });
+    } catch (error) {
+      diagLog?.('Telegram translation failed; sending plain text', {
+        error: String(error),
+        chat_id,
+      });
+      plan.push({ source });
+    }
+  });
+  return plan;
+}
+
+/**
+ * Send `text` as one or more Telegram messages. When `format:'claude'`, each
+ * source chunk is translated to MarkdownV2 and falls back to that chunk's
+ * source (no parse_mode) on a parse-entities error. 429s are retried up to
+ * MAX_429_RETRIES times, respecting `retry_after`. `onChunkSent` reports the
+ * index to pass as `startChunk` to resume after a failure.
  */
 export async function sendText(
   api: Pick<Api, 'sendMessage'>,
@@ -100,54 +168,43 @@ export async function sendText(
   const format = opts.format ?? 'text';
   const replyToMode = opts.replyToMode ?? 'first';
   const chunkMode = opts.chunkMode ?? 'newline';
-  const chunkLimit = Math.min(opts.chunkLimit ?? 4096, 4096);
+  const chunkLimit = Math.min(
+    opts.chunkLimit ?? TELEGRAM_TEXT_LIMIT,
+    TELEGRAM_TEXT_LIMIT,
+  );
   if (!Number.isInteger(chunkLimit) || chunkLimit < 1) {
     throw new Error('chunkLimit must be a positive integer');
   }
 
-  const originalChunks = chunk(text, chunkLimit, chunkMode);
-  // Independent translation loses context inside a spanning fence, link, or
-  // emphasis region. Send affected chunks plainly, preserving literal code and
-  // source markers instead of interpreting code fragments as prose Markdown.
-  const plainChunks = format === 'claude' ? spanningMarkdownChunks(originalChunks) : new Set<number>();
+  const plan = planChunks(text, format, chunkLimit, chunkMode, chat_id);
   const threadId = opts.message_thread_id;
 
   const ids: number[] = [];
-  for (let i = 0; i < originalChunks.length; i++) {
-    const original = originalChunks[i]!;
-    // Telegram rejects messages containing only whitespace. This can be a
-    // trailing newline just past a boundary, even when the reply has content.
-    if (!original.trim()) continue;
-    let prepared = original;
-    let parseMode: 'MarkdownV2' | undefined;
-    if (format === 'claude' && !plainChunks.has(i)) {
-      try {
-        // Telegram's 4096 limit applies after entity parsing, not to the
-        // escaped payload. Source chunks already fit that bound, and this
-        // translator never adds visible characters.
-        // https://core.telegram.org/bots/api#sendmessage
-        prepared = claudeToTelegramV2(original);
-        parseMode = 'MarkdownV2';
-      } catch (error) {
-        diagLog?.('Telegram translation failed; sending plain text', {
-          error: String(error), chat_id,
-        });
-      }
-    }
+  for (let i = opts.startChunk ?? 0; i < plan.length; i++) {
+    const { source, markdownV2 } = plan[i]!;
     const shouldReplyTo =
       opts.reply_to != null &&
       replyToMode !== 'off' &&
-      (replyToMode === 'all' || ids.length === 0);
+      (replyToMode === 'all' || i === 0);
     const extra: Record<string, unknown> = {};
     if (shouldReplyTo) extra.reply_parameters = { message_id: opts.reply_to };
     if (threadId != null) extra.message_thread_id = threadId;
 
+    let id: number;
     try {
-      const id = await sendOneChunk(api, chat_id, prepared, original, parseMode, extra);
-      ids.push(id);
+      id = await sendOneChunk(
+        api,
+        chat_id,
+        markdownV2 ?? source,
+        source,
+        markdownV2 === undefined ? undefined : 'MarkdownV2',
+        extra,
+      );
     } catch (error) {
       throw new PartialSendError([...ids], error);
     }
+    ids.push(id);
+    opts.onChunkSent?.(i + 1);
   }
   return ids;
 }

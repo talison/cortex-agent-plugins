@@ -200,3 +200,126 @@ test('only chunks intersecting a spanning code block become plain', async () => 
   expect(calls.map(c => !!c.opts.parse_mode)).toEqual([true, false, false, true])
   expect(calls[3].text).toBe('*bold*')
 })
+
+// --- Source/translation pairing (audit M19) ---------------------------------
+// Harness's copy chunked the escaped text and the raw text separately, so a
+// parse-error fallback could send a mismatched piece. These pin the pairing
+// in both copies: every payload has an exact source counterpart.
+
+type Call = { text: string; opts: { parse_mode?: string } }
+
+const PARSE_ERROR = "Bad Request: can't parse entities: unexpected end"
+
+/** Undo the translator's escaping. Exact for text with no Markdown constructs. */
+const unescapeV2 = (text: string) => text.replace(/\\([\s\S])/g, '$1')
+
+/** What the reader sees: the escaped payload's text, or the plain payload. */
+const visible = (call: Call) => (call.opts.parse_mode ? unescapeV2(call.text) : call.text)
+
+/** Fake Bot API recording every attempt; `fail` may throw for any attempt. */
+function recordingApi(fail?: (call: Call) => Error | undefined) {
+  const attempts: Call[] = []
+  const delivered: Call[] = []
+  const api = fakeAPI(async (_chat, text: string, opts: Call['opts']) => {
+    const call = { text, opts }
+    attempts.push(call)
+    const error = fail?.(call)
+    if (error) throw error
+    delivered.push(call)
+    return { message_id: 1000 + delivered.length }
+  })
+  return { api, attempts, delivered }
+}
+
+/** Fail only the first MarkdownV2 attempt with a parse error. */
+function failFirstFormatted() {
+  let failed = false
+  return (call: Call) => {
+    if (!call.opts.parse_mode || failed) return undefined
+    failed = true
+    return new Error(PARSE_ERROR)
+  }
+}
+
+/**
+ * ~7k characters dense with MarkdownV2-reserved characters but no Markdown
+ * constructs. Escaped-then-chunked it splits [4076, 3988, 131] against
+ * [4093, 2988] for the source: the shape audit M19 found.
+ */
+function longReply(): string {
+  const paras: string[] = []
+  for (let i = 1; paras.join('\n\n').length < 7000; i++) {
+    paras.push(`Step ${i}. Check the (cached) value = ${i}.5 - see item #${i}!\n`
+      + `Keep a|b, {x} and +1 in mind (v${i}.0.1); it costs $${i}.00.`)
+  }
+  return paras.join('\n\n')
+}
+
+/** 3,489 source characters (one chunk) that escape to 4,889. */
+const escapeHeavyBlock = () => Array.from({ length: 200 }, (_, i) => `${i}. a.b.c-d!e(f)`).join('\n')
+
+test('a parse error on the first chunk falls back to exactly that chunk', async () => {
+  const text = longReply()
+  const { api, attempts, delivered } = recordingApi(failFirstFormatted())
+  await sendText(api, '1', text, { format: 'claude', chunkMode: 'newline' })
+  expect(attempts[0].opts.parse_mode).toBe('MarkdownV2')
+  expect(attempts[1].opts.parse_mode).toBeUndefined()
+  expect(attempts[1].text).toBe(unescapeV2(attempts[0].text))
+  expect(delivered.length).toBeGreaterThan(1)
+  expect(delivered.map(visible).join('')).toBe(text)
+  // Telegram's limit applies to the parsed text, not the escaped payload.
+  for (const call of attempts) expect(visible(call).length).toBeLessThanOrEqual(4096)
+})
+
+test('a parse error on the last chunk falls back to exactly that chunk', async () => {
+  const text = longReply()
+  const tail = text.slice(-40)
+  const isLast = (call: Call) => !!call.opts.parse_mode && unescapeV2(call.text).endsWith(tail)
+  const { api, attempts, delivered } = recordingApi(call => (isLast(call) ? new Error(PARSE_ERROR) : undefined))
+  await sendText(api, '1', text, { format: 'claude', chunkMode: 'newline' })
+  const failedAt = attempts.findIndex(isLast)
+  expect(failedAt).toBe(attempts.length - 2)
+  const fallback = attempts[failedAt + 1]
+  expect(fallback.opts.parse_mode).toBeUndefined()
+  expect(fallback.text).toBe(unescapeV2(attempts[failedAt].text))
+  expect(fallback.text).not.toContain('\\')
+  expect(delivered.map(visible).join('')).toBe(text)
+})
+
+test('a chunk whose escapes pass 4096 goes out whole, paired with its source', async () => {
+  const text = escapeHeavyBlock()
+  const { api, attempts, delivered } = recordingApi(failFirstFormatted())
+  await sendText(api, '1', text, { format: 'claude', chunkMode: 'newline' })
+  expect(attempts).toHaveLength(2)
+  expect(attempts[0].text.length).toBeGreaterThan(4096)
+  expect(attempts[0].opts.parse_mode).toBe('MarkdownV2')
+  expect(unescapeV2(attempts[0].text)).toBe(text)
+  expect(delivered).toHaveLength(1)
+  expect(delivered[0].opts.parse_mode).toBeUndefined()
+  expect(delivered[0].text).toBe(text)
+})
+
+test('resuming from startChunk continues on the same chunk boundaries', async () => {
+  const text = `${longReply()}\n\n${escapeHeavyBlock()}\n\nDone.`
+  const opts = { format: 'claude', chunkMode: 'newline' } as const
+  const full = recordingApi()
+  await sendText(full.api, '1', text, opts)
+  const boundaries = full.delivered.map(visible)
+  expect(boundaries.join('')).toBe(text)
+  expect(boundaries.length).toBeGreaterThanOrEqual(3)
+
+  // First attempt: the connection drops on the third chunk.
+  let nextChunk = 0
+  const first = recordingApi(() => (first.attempts.length === 3 ? new Error('socket hang up') : undefined))
+  const failure = await sendText(first.api, '1', text, { ...opts, onChunkSent: next => { nextChunk = next } })
+    .catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(PartialSendError)
+  expect((failure as PartialSendError).sentIds).toEqual([1001, 1002])
+  expect(nextChunk).toBe(2)
+
+  // The retry resumes at chunk 2, and that chunk hits a parse error.
+  const retry = recordingApi(failFirstFormatted())
+  await sendText(retry.api, '1', text, { ...opts, startChunk: nextChunk })
+  expect(retry.attempts[1].text).toBe(unescapeV2(retry.attempts[0].text))
+  expect([...first.delivered, ...retry.delivered].map(visible)).toEqual(boundaries)
+})

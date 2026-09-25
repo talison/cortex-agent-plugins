@@ -34,8 +34,20 @@ all files remain identical to that revision. The audit fixes modify `chunk.ts`,
 `send.ts`, `markdown-translate.ts`, and `index.ts` locally: preserve source whitespace, translate source chunks independently (use plain text only in chunks intersecting a spanning Markdown region), retain 429 retry handling on plain fallback, and
 expose `PartialSendError` with confirmed message IDs.
 
-Port those changes to harness before the next normal core sync, or explicitly
-reapply them after syncing. `scripts/sync-telegram-core.sh` replaces the core
+Harness's `audit-batch2` branch (commit `94b2138`, 2026-09-24, audit M19) ports
+these changes, except `PartialSendError`, into `src/telegram-core/`. Both copies
+also gained `startChunk`/`onChunkSent` resumption. Neither re-splits a chunk
+whose escaped payload passes 4096: Telegram counts the limit after entity
+parsing. After that commit, `core/send.ts`
+differs from harness's copy only by `PartialSendError` and its wrapping of
+`sendText` failures. The other fork-local deltas are the `PartialSendError`
+export in `index.ts` and a `let` in `markdown-translate.ts`. `typing.ts` lags
+harness (no `stopAllTyping`).
+
+Do not sync from harness until that branch reaches its `main` on GitHub: the
+sync script clones from there, and the old `send.ts` it would bring back has
+the M19 mismatch. Port `PartialSendError` to harness before the next normal core
+sync, or explicitly reapply it after syncing. `scripts/sync-telegram-core.sh` replaces the core
 directory; it does not merge local changes. Run the Telegram tests and typecheck
 before accepting a sync so delivery regressions cannot ship silently. The
 regression tests stay outside `core/` and are not overwritten by the sync.

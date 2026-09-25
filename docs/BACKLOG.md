@@ -16,8 +16,9 @@ worth its rollout cost at review time.
   watchdog uses stdin state so normal wrapper reparenting does not stop it.
 - CI runs tests and pinned TypeScript checks on macOS and Linux.
 
-The shared-core delivery fixes are currently fork-local; see `UPSTREAM.md`
-before syncing from harness.
+Harness's `audit-batch2` branch (2026-09-24, audit M19) ports the shared-core
+delivery fixes, except `PartialSendError`. Until it reaches harness `main`, the
+fixes are fork-local; see `UPSTREAM.md` before syncing from harness.
 
 ## telegram plugin (fork-local)
 
