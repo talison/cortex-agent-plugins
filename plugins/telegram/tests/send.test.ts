@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { PartialSendError, sendText } from '../core/send.ts'
 import { sendStream, type SendStreamOpts } from '../core/stream.ts'
 import { chunk } from '../core/chunk.ts'
-import { sendReply } from '../lib/reply.ts'
+import { replyChunking, sendReply } from '../lib/reply.ts'
 
 function fakeAPI(sendMessage: (...args: any[]) => Promise<any>) {
   return { sendMessage, sendPhoto: async () => ({ message_id: 10 }), sendDocument: async () => ({ message_id: 11 }) } as any
@@ -416,4 +416,45 @@ test('sendStream does not apply one resume point to every flush', async () => {
   expect(delivered.map(c => c.text)).toEqual(['one', 'two', 'three'])
   expect(ids).toHaveLength(3)
   expect(resumed).toBe(0)
+})
+
+// --- Default chunk mode ------------------------------------------------------
+
+/** ~9k characters of formatted prose in short paragraphs. */
+function formattedReply(): string {
+  const paras: string[] = []
+  for (let i = 1; paras.join('\n\n').length < 9000; i++) {
+    paras.push(`## Step ${i}\nRun \`task-${i}\` with **care**. It prints a value (v${i}.0); check it twice!`)
+  }
+  return paras.join('\n\n')
+}
+
+test('with no configured mode a multi-paragraph reply stays formatted in every chunk', async () => {
+  const settings = replyChunking({})
+  expect(settings).toEqual({ chunkMode: 'newline', chunkLimit: 4096 })
+  const { api, delivered } = recordingApi()
+  await sendReply(api, '1', formattedReply(), [], { format: 'claude', ...settings })
+  expect(delivered.length).toBeGreaterThan(2)
+  for (const call of delivered) {
+    expect(call.opts.parse_mode).toBe('MarkdownV2')
+    expect(call.text).toContain('*care*')
+  }
+})
+
+test('an explicit length mode still cuts at exactly the limit', async () => {
+  const settings = replyChunking({ chunkMode: 'length', textChunkLimit: 5000 })
+  expect(settings).toEqual({ chunkMode: 'length', chunkLimit: 4096 })
+  const text = formattedReply()
+  const { api, delivered } = recordingApi()
+  await sendReply(api, '1', text, [], { format: 'claude', ...settings })
+  // The cuts fall mid-line, so the chunks beside them go plain.
+  expect(delivered[0].opts.parse_mode).toBeUndefined()
+  expect(delivered[0].text).toBe(text.slice(0, 4096))
+})
+
+test('newline mode still hard-cuts a single line longer than the limit', async () => {
+  expect(chunk('x'.repeat(5000), 4096, 'newline').map(c => c.length)).toEqual([4096, 904])
+  const { api, delivered } = recordingApi()
+  await sendReply(api, '1', 'x'.repeat(5000), [], { format: 'claude', ...replyChunking({}) })
+  expect(delivered.map(c => c.text.length)).toEqual([4096, 904])
 })

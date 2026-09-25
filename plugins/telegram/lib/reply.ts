@@ -1,8 +1,26 @@
 import { InputFile, type Api } from 'grammy'
 import { extname } from 'path'
+import type { ChunkMode } from '../core/chunk.js'
 import { PartialSendError, sendText, type SendTextOpts } from '../core/send.js'
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+const MAX_CHUNK_LIMIT = 4096
+
+/**
+ * Chunking for replies from access.json. `newline` is the default, as in
+ * harness's telegram-core: a chunk beside a cut inside a line goes out plain,
+ * and `length` mode cuts inside lines almost every time. Newline mode still
+ * hard-cuts a single line longer than the limit.
+ */
+export function replyChunking(access: { textChunkLimit?: number; chunkMode?: ChunkMode }): {
+  chunkMode: ChunkMode
+  chunkLimit: number
+} {
+  return {
+    chunkMode: access.chunkMode ?? 'newline',
+    chunkLimit: Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT)),
+  }
+}
 
 export async function sendReply(
   api: Pick<Api, 'sendMessage' | 'sendPhoto' | 'sendDocument'>,

@@ -27,7 +27,7 @@ import {
 } from './core/index.js'
 import { PermissionRequests, canReplyToPermission } from './lib/permissions.js'
 import { runPolling } from './lib/polling.js'
-import { sendReply } from './lib/reply.js'
+import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
@@ -140,7 +140,7 @@ type Access = {
   replyToMode?: 'off' | 'first' | 'all'
   /** Max chars per outbound message before splitting. Default: 4096 (Telegram's hard cap). */
   textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
+  /** 'newline' (default) prefers paragraph, then line boundaries; 'length' cuts at the limit. */
   chunkMode?: 'length' | 'newline'
 }
 
@@ -153,7 +153,6 @@ function defaultAccess(): Access {
   }
 }
 
-const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
@@ -522,15 +521,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
         const sentIds = await sendReply(bot.api, chat_id, text, files, {
           format,
           reply_to,
           replyToMode: replyMode,
-          chunkMode: mode,
-          chunkLimit: limit,
+          ...replyChunking(access),
         })
 
         const result =
