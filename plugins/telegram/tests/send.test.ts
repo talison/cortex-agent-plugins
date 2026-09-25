@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
 import { PartialSendError, sendText } from '../core/send.ts'
+import { sendStream, type SendStreamOpts } from '../core/stream.ts'
 import { chunk } from '../core/chunk.ts'
 import { sendReply } from '../lib/reply.ts'
 
@@ -144,11 +145,12 @@ test('paragraph boundaries preserve heading translation', async () => {
 })
 
 test('identifiers and list bullets do not disable formatting in long replies', async () => {
+  // The hard cut lands just after a newline, so both chunks translate.
   const calls: any[] = []
   await sendText(fakeAPI(async (_chat, text, opts) => {
     calls.push({ text, opts })
     return { message_id: calls.length }
-  }), '1', 'a'.repeat(5000) + ' file_id **bold**\n* list item', { format: 'claude', chunkMode: 'length' })
+  }), '1', 'a'.repeat(4095) + '\n' + 'a'.repeat(904) + ' file_id **bold**\n* list item', { format: 'claude', chunkMode: 'length' })
   expect(calls).toHaveLength(2)
   expect(calls[1].opts.parse_mode).toBe('MarkdownV2')
   expect(calls[1].text).toContain('*bold*')
@@ -192,7 +194,8 @@ test('4096 source characters retain formatting even when escapes expand the payl
 
 test('only chunks intersecting a spanning code block become plain', async () => {
   const calls: any[] = []
-  const source = 'a'.repeat(100) + '```\n' + 'x'.repeat(190) + '\n```\n\n**bold**'
+  // Cuts at 100 and 300 fall at newlines; the cut at 200 is inside the fence.
+  const source = 'a'.repeat(99) + '\n```\n' + 'x'.repeat(190) + '\n```\n\n**bold**'
   await sendText(fakeAPI(async (_chat, text, opts) => {
     calls.push({ text, opts })
     return { message_id: calls.length }
@@ -322,4 +325,95 @@ test('resuming from startChunk continues on the same chunk boundaries', async ()
   await sendText(retry.api, '1', text, { ...opts, startChunk: nextChunk })
   expect(retry.attempts[1].text).toBe(unescapeV2(retry.attempts[0].text))
   expect([...first.delivered, ...retry.delivered].map(visible)).toEqual(boundaries)
+})
+
+// --- Codex review of the M19 fix -------------------------------------------
+
+// Translated alone, a chunk's edge reads as a line start and a word boundary.
+// Text next to a mid-line cut would become Markdown the whole reply never had.
+async function sendClaude(text: string, chunkMode: 'length' | 'newline') {
+  const { api, delivered } = recordingApi()
+  await sendText(api, '1', text, { format: 'claude', chunkMode })
+  return delivered
+}
+
+/** Every chunk went plain, and together they are the source. */
+function expectAllPlain(delivered: Call[], text: string) {
+  for (const call of delivered) expect(call.opts.parse_mode).toBeUndefined()
+  expect(delivered.map(c => c.text).join('')).toBe(text)
+}
+
+test('underscores just past a mid-line cut stay literal', async () => {
+  const text = 'a'.repeat(4096) + '_name_'
+  const delivered = await sendClaude(text, 'length')
+  expectAllPlain(delivered, text)
+  expect(delivered[1].text).toBe('_name_')
+})
+
+test('underscores just before a mid-line cut stay literal', async () => {
+  // Whole, `_name_tail` is not emphasis; cut after `_name_`, it would be.
+  const text = 'x'.repeat(4089) + ' _name_' + 'tail'
+  const delivered = await sendClaude(text, 'length')
+  expect(delivered[0].text.endsWith(' _name_')).toBe(true)
+  expectAllPlain(delivered, text)
+})
+
+test('a # just past a mid-line cut is not a heading', async () => {
+  const text = 'a'.repeat(4096) + '# not a heading'
+  const delivered = await sendClaude(text, 'length')
+  expectAllPlain(delivered, text)
+  expect(delivered[1].text).toBe('# not a heading')
+})
+
+test('a > just past a mid-line cut is not a blockquote', async () => {
+  const text = 'a'.repeat(4096) + '> not a quote'
+  const delivered = await sendClaude(text, 'length')
+  expectAllPlain(delivered, text)
+  expect(delivered[1].text).toBe('> not a quote')
+})
+
+test('a cut at a newline keeps line-start Markdown', async () => {
+  const delivered = await sendClaude('a'.repeat(4090) + '\n# Title\n> quote _name_', 'newline')
+  expect(delivered).toHaveLength(2)
+  for (const call of delivered) expect(call.opts.parse_mode).toBe('MarkdownV2')
+  expect(delivered[1].text).toContain('*Title*')
+  expect(delivered[1].text).toContain('>quote _name_')
+})
+
+test('a startChunk past the last chunk is an error, not an empty success', async () => {
+  const { api, attempts } = recordingApi()
+  await expect(sendText(api, '1', 'a.'.repeat(1500), { format: 'claude', startChunk: 1 }))
+    .rejects.toThrow('startChunk 1')
+  expect(attempts).toHaveLength(0)
+})
+
+test('a throwing onChunkSent keeps the confirmed ID', async () => {
+  const { api, delivered } = recordingApi()
+  const failure = await sendText(api, '1', 'a'.repeat(5000), {
+    onChunkSent: () => { throw new Error('checkpoint failed') },
+  }).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(PartialSendError)
+  expect((failure as PartialSendError).sentIds).toEqual([1001])
+  expect((failure as Error).message).toBe('checkpoint failed')
+  expect(delivered).toHaveLength(1)
+})
+
+test('reply reports a delivery confirmed before onChunkSent threw', async () => {
+  const { api } = recordingApi()
+  await expect(sendReply(api, '1', 'hello', [], {
+    onChunkSent: () => { throw new Error('checkpoint failed') },
+  })).rejects.toThrow('1 part(s) sent (ids: 1001); do not resend these parts')
+})
+
+test('sendStream does not apply one resume point to every flush', async () => {
+  // startChunk/onChunkSent resume a single sendText call. Each flush is its
+  // own text, so forwarding them would skip the first chunk of every flush.
+  const { api, delivered } = recordingApi()
+  let resumed = 0
+  const opts = { minFlushChars: 3, startChunk: 1, onChunkSent: () => { resumed++ } } as unknown as SendStreamOpts
+  async function* parts() { yield 'one\n\n'; yield 'two\n\n'; yield 'three' }
+  const ids = await sendStream(api, '1', parts(), opts)
+  expect(delivered.map(c => c.text)).toEqual(['one', 'two', 'three'])
+  expect(ids).toHaveLength(3)
+  expect(resumed).toBe(0)
 })

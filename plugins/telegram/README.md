@@ -109,10 +109,14 @@ needed. CI runs both plugins on macOS and Linux.
 Long replies are split before Markdown translation. The configured limit applies
 to source text. Telegram's [4096-character limit](https://core.telegram.org/bots/api#sendmessage)
 is measured after entity parsing, so added escape characters do not consume the
-limit. Only chunks intersecting a Markdown region split by a boundary are sent
-plainly; unrelated chunks retain formatting. Parse errors fall back to the exact
-source chunk. A partial-send error lists confirmed message IDs so a retry can
-avoid duplicating delivered parts.
+limit. Chunks intersecting a Markdown region split by a boundary are sent
+plainly, as are both chunks beside a cut inside a line: alone, text at that
+edge could read as italics, a heading, or a quote. A cut at a newline keeps
+formatting, so the default `length` chunk mode, which cuts at exactly the
+limit, usually sends multi-part replies plain; `newline` mode keeps them
+formatted. Parse errors fall back to the exact source chunk. A partial-send
+error lists confirmed message IDs, including one confirmed just before a
+failing `onChunkSent`, so a retry can avoid duplicating delivered parts.
 
 
 After eight consecutive polling conflicts (HTTP 409), the plugin shuts down

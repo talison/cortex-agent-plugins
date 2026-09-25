@@ -31,9 +31,25 @@ export interface SendTextOpts {
    */
   chunkLimit?: number;
   message_thread_id?: number;
+  /**
+   * First chunk to send, from an earlier `onChunkSent`. Valid only under the
+   * same `CHUNK_PLAN_VERSION`; past the last chunk it is an error.
+   */
   startChunk?: number;
+  /**
+   * Called after each confirmed chunk with the index to resume from. If it
+   * throws, sendText sends nothing more and rethrows as a PartialSendError
+   * that includes the chunk just confirmed.
+   */
   onChunkSent?: (nextChunk: number) => void;
 }
+
+/**
+ * Identifies how `sendText` splits a text into chunks. A saved `startChunk`
+ * means the same thing only under the same plan; bump this whenever the same
+ * text could split differently. 2: source-first chunking (2026-09-24).
+ */
+export const CHUNK_PLAN_VERSION = 2;
 
 const MAX_429_RETRIES = 3;
 
@@ -105,6 +121,22 @@ interface PlannedChunk {
 }
 
 /**
+ * Chunks on either side of a cut inside a line. Translated alone, a chunk's
+ * edge reads as a line start and a word boundary, so `_name_`, `# ` or `>`
+ * beside the cut would become Markdown the whole text never had. A cut at a
+ * newline keeps line-start semantics.
+ */
+function midLineCutChunks(chunks: string[]): Set<number> {
+  const affected = new Set<number>();
+  for (let i = 1; i < chunks.length; i++) {
+    if (!chunks[i - 1]!.endsWith('\n') && !chunks[i]!.startsWith('\n')) {
+      affected.add(i - 1).add(i);
+    }
+  }
+  return affected;
+}
+
+/**
  * The messages `sendText` delivers for `text`. The source is chunked first and
  * each chunk translated on its own, so a parse-error fallback sends exactly
  * the text its failed payload encoded. The plan depends only on its inputs:
@@ -126,10 +158,16 @@ function planChunks(
 ): PlannedChunk[] {
   const sources = chunk(text, limit, mode);
   // Independent translation loses context inside a spanning fence, link, or
-  // emphasis region. Send affected chunks plainly, preserving literal code
-  // and source markers instead of interpreting code fragments as prose.
+  // emphasis region, and at a cut inside a line. Send affected chunks
+  // plainly, preserving literal code and source markers instead of
+  // interpreting fragments as prose Markdown.
   const plain =
-    format === 'claude' ? spanningMarkdownChunks(sources) : undefined;
+    format === 'claude'
+      ? new Set([
+          ...spanningMarkdownChunks(sources),
+          ...midLineCutChunks(sources),
+        ])
+      : undefined;
   const plan: PlannedChunk[] = [];
   sources.forEach((source, i) => {
     // Telegram rejects whitespace-only text. A cut can leave a trailing
@@ -177,10 +215,22 @@ export async function sendText(
   }
 
   const plan = planChunks(text, format, chunkLimit, chunkMode, chat_id);
+  const start = opts.startChunk ?? 0;
+  // Resuming past the end would send nothing and report success, and the
+  // caller would discard what may be an undelivered message.
+  if (
+    !Number.isInteger(start) ||
+    start < 0 ||
+    (start > 0 && start >= plan.length)
+  ) {
+    throw new Error(
+      `invalid startChunk ${start} for a text of ${plan.length} chunk(s)`,
+    );
+  }
   const threadId = opts.message_thread_id;
 
   const ids: number[] = [];
-  for (let i = opts.startChunk ?? 0; i < plan.length; i++) {
+  for (let i = start; i < plan.length; i++) {
     const { source, markdownV2 } = plan[i]!;
     const shouldReplyTo =
       opts.reply_to != null &&
@@ -204,7 +254,11 @@ export async function sendText(
       throw new PartialSendError([...ids], error);
     }
     ids.push(id);
-    opts.onChunkSent?.(i + 1);
+    try {
+      opts.onChunkSent?.(i + 1);
+    } catch (error) {
+      throw new PartialSendError([...ids], error);
+    }
   }
   return ids;
 }

@@ -2,7 +2,14 @@
 import type { Api } from 'grammy';
 import { sendText, type SendTextOpts } from './send.js';
 
-export interface SendStreamOpts extends SendTextOpts {
+/**
+ * `startChunk`/`onChunkSent` resume one `sendText` call. A stream's flushes
+ * are separate texts, so they are not stream options.
+ */
+export interface SendStreamOpts extends Omit<
+  SendTextOpts,
+  'startChunk' | 'onChunkSent'
+> {
   minFlushChars?: number;
   flushOnParagraph?: boolean;
   idleFlushMs?: number;
@@ -32,7 +39,13 @@ export async function sendStream(
     if (!buffer) return;
     const toSend = buffer;
     buffer = '';
-    const sendOpts: SendTextOpts = { ...opts };
+    // Strip resume options a caller passed despite the type: applied to
+    // every flush, they would skip each flush's first chunk.
+    const sendOpts: SendTextOpts = {
+      ...opts,
+      startChunk: undefined,
+      onChunkSent: undefined,
+    };
     if (!firstFlush) {
       sendOpts.reply_to = undefined;
     }

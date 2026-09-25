@@ -34,13 +34,16 @@ all files remain identical to that revision. The audit fixes modify `chunk.ts`,
 `send.ts`, `markdown-translate.ts`, and `index.ts` locally: preserve source whitespace, translate source chunks independently (use plain text only in chunks intersecting a spanning Markdown region), retain 429 retry handling on plain fallback, and
 expose `PartialSendError` with confirmed message IDs.
 
-Harness's `audit-batch2` branch (commit `94b2138`, 2026-09-24, audit M19) ports
-these changes, except `PartialSendError`, into `src/telegram-core/`. Both copies
-also gained `startChunk`/`onChunkSent` resumption. Neither re-splits a chunk
-whose escaped payload passes 4096: Telegram counts the limit after entity
-parsing. After that commit, `core/send.ts`
-differs from harness's copy only by `PartialSendError` and its wrapping of
-`sendText` failures. The other fork-local deltas are the `PartialSendError`
+Harness's `audit-batch2` branch (commits `94b2138` and `f5710bd`, 2026-09-24,
+audit M19 and its codex review) ports these changes, except `PartialSendError`,
+into `src/telegram-core/`. Both copies also gained `startChunk`/`onChunkSent`
+resumption with a `CHUNK_PLAN_VERSION`, plain text on both sides of a
+mid-line cut, and a `sendStream` that no longer forwards resume options.
+Neither re-splits a chunk whose escaped payload passes 4096: Telegram counts
+the limit after entity parsing. After those commits, `core/send.ts` differs
+from harness's copy only by `PartialSendError`, its wrapping of send and
+`onChunkSent` failures, and the `onChunkSent` comment; `core/stream.ts`
+differs only by its SOURCE header. The other fork-local deltas are the `PartialSendError`
 export in `index.ts` and a `let` in `markdown-translate.ts`. `typing.ts` lags
 harness (no `stopAllTyping`).
 
