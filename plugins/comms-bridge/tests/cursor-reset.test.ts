@@ -81,9 +81,16 @@ Object.defineProperty(process, 'ppid', { configurable: true, get: () => original
 setTimeout(() => Object.defineProperty(process, 'ppid', { get: () => 1 }), 100);
 `)
   }
+  // Channel ownership (lib/owner.ts): this test process stands in for the
+  // start-cortex.sh session, so the spawned server owns the inbox wherever the
+  // suite runs (inside a Claude Code session or not).
+  const sessionFile = join(dir, 'session.json')
+  writeFileSync(sessionFile, JSON.stringify({ pid: process.pid }))
   const proc = Bun.spawn(['bun', ...(simulateReparent ? ['--preload', preload] : []), SERVER], {
     env: {
       ...process.env,
+      CORTEX_CHANNEL_OWNER: '1',
+      CORTEX_CHANNEL_SESSION_FILE: sessionFile,
       COMMS_BRIDGE_URL: `http://127.0.0.1:${bridge.port}`,
       COMMS_BRIDGE_CURSOR_PATH: cursorFile,
       COMMS_BRIDGE_STATE_DIR: join(dir, 'state'),

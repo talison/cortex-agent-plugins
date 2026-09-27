@@ -27,6 +27,7 @@ import {
 } from './core/index.js'
 import { PermissionRequests, canReplyToPermission } from './lib/permissions.js'
 import { runPolling } from './lib/polling.js'
+import { channelOwner } from './lib/owner.js'
 import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
@@ -88,6 +89,12 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 })
 
 debugLog(`startup: ppid=${process.ppid}`)
+
+// Only the start-cortex.sh session polls (lib/owner.ts). Any other session
+// keeps its tools but never touches getUpdates or the bot.pid slot.
+const OWNER = channelOwner()
+debugLog(`owner: ${OWNER.owner ? 'yes' : 'no'} (${OWNER.reason})`)
+if (!OWNER.owner) process.stderr.write(`telegram channel: inbound disabled — ${OWNER.reason}\n`)
 
 // Telegram allows exactly one getUpdates consumer per token. The stale-PID
 // kill + PID_FILE claim is deferred until past mcp.connect() + shutdown
@@ -365,8 +372,10 @@ const mcp = new Server(
         // Declaring this asserts we authenticate the replier — which we do:
         // gate()/access.allowFrom already drops non-allowlisted senders before
         // handleInbound runs. A server that can't authenticate the replier
-        // should NOT declare this.
-        'claude/channel/permission': {},
+        // should NOT declare this. Nor should a non-owner (lib/owner.ts): it
+        // never polls, so a replier's answer would reach the Cortex session's
+        // poller, which does not hold this session's pending request.
+        ...(OWNER.owner ? { 'claude/channel/permission': {} } : {}),
       },
     },
     instructions: [
@@ -389,8 +398,9 @@ const pendingPermissions = new PermissionRequests()
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
 // "single-user mode for official plugins." Anyone in access.allowFrom
-// already passed explicit pairing; group members haven't.
-mcp.setNotificationHandler(
+// already passed explicit pairing; group members haven't. Owner only (see the
+// capability above) — Claude Code sends none to a server that did not opt in.
+if (OWNER.owner) mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
     params: z.object({
@@ -619,7 +629,7 @@ process.on('SIGHUP', () => shutdown('SIGHUP'))
 // shutdown handlers above fire first and set shuttingDown — we skip the
 // stale-PID SIGTERM and never write our own PID, leaving the real poller
 // alone. Only stable subprocesses reach this block.
-if (!shuttingDown) {
+if (!shuttingDown && OWNER.owner) {
   try {
     const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
     if (stale > 1 && stale !== process.pid) {
@@ -966,7 +976,7 @@ bot.api.config.use(async (prev, method, payload, signal) => {
   return response
 })
 
-void runPolling({
+if (OWNER.owner) void runPolling({
   isShuttingDown: () => shuttingDown,
   isConflict: error => error instanceof GrammyError && error.error_code === 409,
   isFatal: error => error instanceof GrammyError && error.error_code === 401,

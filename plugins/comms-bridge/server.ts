@@ -41,6 +41,7 @@ import { Backoff } from './lib/backoff.ts'
 import { BridgeClient, BridgeError, type InboxMessage } from './lib/bridge-client.ts'
 import { Cursor } from './lib/cursor.ts'
 import { renderPayload } from './lib/payload.ts'
+import { channelOwner } from './lib/owner.ts'
 
 const AGENT = 'cortex'
 const ALLOWED_PEERS = new Set(['max', 'muse'])
@@ -121,6 +122,12 @@ let bridgeToken = resolveBridgeToken()
 debugLog(
   `startup: ppid=${process.ppid} bridge=${BRIDGE_BASE_URL} auth=${bridgeToken ? 'token' : 'none'}`,
 )
+
+// Only the start-cortex.sh session reads the inbox (lib/owner.ts); another
+// session would consume Cortex's messages. Non-owners keep the send tool.
+const OWNER = channelOwner()
+debugLog(`owner: ${OWNER.owner ? 'yes' : 'no'} (${OWNER.reason})`)
+if (!OWNER.owner) process.stderr.write(`comms-bridge channel: inbound disabled — ${OWNER.reason}\n`)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. Same pattern as telegram fork.
@@ -379,7 +386,7 @@ async function deliverMessage(msg: InboxMessage): Promise<void> {
   })
 }
 
-void (async () => {
+if (OWNER.owner) void (async () => {
   const backoff = new Backoff()
   let cursorValue = cursor.read()
   debugLog('poll loop starting', { cursor: cursorValue })
