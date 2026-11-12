@@ -25,6 +25,13 @@ A submodule would force our fork to track upstream's full tree. A remote is a li
   behind dmPolicy via `dmCommandGate()`; commands previously replied to any
   DM user, leaking bot presence under allowlist/disabled policies. Only
   upstream telegram change since the bb77301 seed. Shipped as 0.1.0-fork.5.
+- 2026-08-17 — ported `1e96c6b` (#1424, upstream v0.0.7 reliability rollup):
+  verify a stale bot.pid holder is a server.ts process before SIGTERM, drop
+  the ppid watchdog check, send `bun install` output to stderr. Skipped its
+  TELEGRAM_STATE_DIR/CLAUDE_CONFIG_DIR resolution in the skills: this fork
+  runs one bot on the default state dir. Shipped as 0.1.0-fork.6 (`978b2972`).
+- 2026-11-11 — checked to upstream `e37d307b`: the only other telegram
+  commits since are README install-note edits (`c5b12e0`, `de90047`).
 
 
 ## Fork-local core delivery changes
