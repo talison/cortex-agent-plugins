@@ -20,12 +20,15 @@ export async function runPolling(opts: {
   onExhausted: (failure: PollFailure) => void
   settleMs?: number
   onSettled?: () => void
+  onSettledError?: (error: unknown) => void
   sleep?: (ms: number) => Promise<void>
 }): Promise<void> {
   const sleep = opts.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
   if (opts.settleMs) await sleep(opts.settleMs)
   if (opts.isShuttingDown()) return
-  opts.onSettled?.()
+  // The claim is best-effort: a throw must not leave a live server that
+  // never polls (Fable review).
+  try { opts.onSettled?.() } catch (error) { opts.onSettledError?.(error) }
   let attempt = 0
   let conflicts = 0
   while (!opts.isShuttingDown()) {

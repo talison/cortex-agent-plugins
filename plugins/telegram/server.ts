@@ -30,8 +30,8 @@ import { lastWord, runPolling } from './lib/polling.js'
 import { channelOwner } from './lib/owner.js'
 import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
-import { handOff } from './lib/inbound.js'
-import { accessReader, type Access } from './lib/access.js'
+import { deliverBounded, handOff } from './lib/inbound.js'
+import { accessReader, writeAccessFile, type Access } from './lib/access.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { execFileSync } from 'child_process'
@@ -197,9 +197,7 @@ function assertAllowedChat(chat_id: string): void {
 function saveAccess(a: Access): void {
   if (STATIC) return
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, ACCESS_FILE)
+  writeAccessFile(ACCESS_FILE, a, msg => debugLog(msg))
 }
 
 function pruneExpired(a: Access): boolean {
@@ -565,22 +563,53 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
+// Settles when shutdown starts: a hand-off still waiting on the transport
+// gives up at once, so its "may not have reached" notice can still go out.
+let markDying: () => void = () => {}
+const dying = new Promise<void>(resolve => { markDying = resolve })
+// Hand-offs (and their notices) in progress; shutdown waits for them, bounded.
+const inflight = new Set<Promise<unknown>>()
+function track<T>(p: Promise<T>): Promise<T> {
+  inflight.add(p)
+  void p.finally(() => inflight.delete(p)).catch(() => {})
+  return p
+}
+// The MCP transport can no longer carry a message to Claude.
+function transportDead(): boolean {
+  return shuttingDown || process.stdin.readableEnded || process.stdout.destroyed || process.stdout.writableEnded
+}
+const BOUNDED = { isDead: transportDead, dying, stream: process.stdout }
+// Permission verdicts go through the same bounds: a stalled send there held
+// the update loop just the same (Fable review). A rejection reaches the
+// callers' "Delivery failed" path and leaves the request pending.
+const sendPermissionVerdict = (params: { request_id: string; behavior: 'allow' | 'deny' }) =>
+  track(deliverBounded(() => mcp.notification({ method: 'notifications/claude/channel/permission', params }), BOUNDED))
+
 function shutdown(trigger: string, exitCode = 0): void {
   if (shuttingDown) return
   shuttingDown = true
+  markDying()
   const uptime = Math.round((Date.now() - startedAt) / 1000)
   debugLog(`shutdown trigger=${trigger} uptime=${uptime}s`)
   process.stderr.write(`telegram channel: shutting down (${trigger}, uptime=${uptime}s)\n`)
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
+  // Let an in-flight hand-off finish telling its sender (at most 2 s), then
   // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(exitCode), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(exitCode))
+  // may take up to its long-poll timeout to return. Force-exit at 4 s.
+  setTimeout(() => process.exit(exitCode), 4000)
+  void Promise.race([Promise.allSettled([...inflight]), new Promise(r => setTimeout(r, 2000))])
+    .then(() => bot.stop())
+    .finally(() => process.exit(exitCode))
 }
 process.stdin.on('end', () => shutdown('stdin:end'))
 process.stdin.on('close', () => shutdown('stdin:close'))
+// A failed stdout (EPIPE once the session is gone) is a dead transport.
+process.stdout.on('error', err => {
+  debugLog('stdout error', { error: String(err) })
+  shutdown('stdout:error')
+})
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGHUP', () => shutdown('SIGHUP'))
@@ -609,7 +638,14 @@ function claimPollerSlot(): void {
       }
     }
   } catch {}
-  writeFileSync(PID_FILE, String(process.pid))
+  // A failed write must not reject runPolling and leave a live server with
+  // dead inbound (Fable review): poll without the pid file, and say so.
+  try {
+    writeFileSync(PID_FILE, String(process.pid))
+  } catch (err) {
+    process.stderr.write(`telegram channel: could not write ${PID_FILE}: ${err}; polling without it\n`)
+    debugLog('bot.pid write failed; polling without it', { error: String(err) })
+  }
 }
 
 // Orphan watchdog: belt-and-suspenders for the stdin 'end'/'close' handlers
@@ -718,7 +754,7 @@ bot.on('callback_query:data', async ctx => {
   let accepted: boolean
   try {
     accepted = await pendingPermissions.reply(request_id, behavior === 'allow' ? 'allow' : 'deny', access, ctx,
-      params => mcp.notification({ method: 'notifications/claude/channel/permission', params }))
+      sendPermissionVerdict)
   } catch (error) {
     debugLog('permission reply delivery failed', { error: String(error), request_id })
     await ctx.answerCallbackQuery({ text: 'Delivery failed. Please try again.' }).catch(() => {})
@@ -865,7 +901,7 @@ async function handleInbound(
     try {
       accepted = await pendingPermissions.reply(
         permMatch[2]!.toLowerCase(), behavior, access, ctx,
-        params => mcp.notification({ method: 'notifications/claude/channel/permission', params }),
+        sendPermissionVerdict,
       )
     } catch (error) {
       debugLog('permission reply delivery failed', { error: String(error), request_id: permMatch[2] })
@@ -912,7 +948,7 @@ async function handleInbound(
   // annotation is forgeable by any allowlisted sender typing that string.
   // Telegram has the update confirmed whatever happens here, so a lost
   // hand-off is logged and the sender asked to resend (lib/inbound.ts).
-  await handOff(
+  await track(handOff(
     () => mcp.notification({
       method: 'notifications/claude/channel',
       params: {
@@ -926,7 +962,8 @@ async function handleInbound(
       stopTyping(chat_id)
       await ctx.reply('⚠️ That message may not have reached the session (it may be restarting). Please send it again in a minute.')
     },
-  )
+    BOUNDED,
+  ))
 }
 
 // Without this, any throw in a message handler stops polling permanently
@@ -946,14 +983,16 @@ bot.api.config.use(async (prev, method, payload, signal) => {
   return response
 })
 
-const CONFLICT_EXIT_NOTICE =
-  '⚠️ Telegram inbound to the Cortex session has stopped: another poller holds this bot ' +
-  '(409 Conflict after 8 tries). Messages here will not reach the session until it restarts ' +
-  '(ssh cortex, then scripts/restart-cortex.sh).'
+// Softly worded: the poller that won may be a legitimate replacement.
+const conflictExitNotice = (attempts: number) =>
+  `⚠️ Telegram inbound to the Cortex session may have stopped: this poller got 409 Conflict ` +
+  `${attempts} times in a row and exited. If messages here go unanswered, restart the session ` +
+  `(ssh cortex, then scripts/restart-cortex.sh).`
 
 if (OWNER.owner) void runPolling({
   settleMs: POLL_SETTLE_MS,
   onSettled: claimPollerSlot,
+  onSettledError: err => debugLog('bot.pid claim failed; polling anyway', { error: String(err) }),
   isShuttingDown: () => shuttingDown,
   isConflict: error => error instanceof GrammyError && error.error_code === 409,
   isFatal: error => error instanceof GrammyError && error.error_code === 401,
@@ -990,9 +1029,9 @@ if (OWNER.owner) void runPolling({
   },
   // A persistent 409 still lets the bot send, so the allowlisted DMs hear it
   // before inbound goes quiet (2026-11-16 audit, finding 1). A 401 cannot send.
-  onExhausted: ({ fatal }) => {
+  onExhausted: ({ fatal, attempt }) => {
     if (fatal) return shutdown('polling:unauthorized', 1)
-    void lastWord((chat, text) => bot.api.sendMessage(chat, text), loadAccess().allowFrom, CONFLICT_EXIT_NOTICE, 5000)
+    void lastWord((chat, text) => bot.api.sendMessage(chat, text), loadAccess().allowFrom, conflictExitNotice(attempt), 5000)
       .finally(() => shutdown('polling:conflict', 1))
   },
 })

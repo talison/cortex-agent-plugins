@@ -39,11 +39,56 @@ test('a stdio transport whose stdout never drains cannot hold the update loop', 
   const delivered = await handOff(
     () => server.notification({ method: 'notifications/claude/channel', params: { content: 'hi', meta: {} } }),
     error => { lost.push(String(error)) },
-    100,
+    { timeoutMs: 100, stream: stalled },
   )
   expect(delivered).toBe(false)
   expect(lost).toEqual(['Error: hand-off timed out after 100 ms'])
   expect(Date.now() - started).toBeLessThan(2000)
+  // The abandoned send's once('drain') is not left behind (Fable review).
+  expect(stalled.listenerCount('drain')).toBe(0)
+})
+
+test('a destroyed stdout is a lost hand-off at once, never a send into the void', async () => {
+  // During a restart stdout dies with the session; the old await either
+  // "succeeded" into a dead pipe or stalled past the exit (Fable review).
+  const { Server } = await import(`${base}/server/index.js`)
+  const { StdioServerTransport } = await import(`${base}/server/stdio.js`)
+  const out = new Writable({ write(_c, _e, cb) { cb() } })
+  out.on('error', () => {})
+  const server = new Server({ name: 't', version: '0' }, { capabilities: { experimental: { 'claude/channel': {} } } })
+  await server.connect(new StdioServerTransport(new PassThrough(), out))
+  out.destroy()
+
+  let sends = 0
+  const lost: string[] = []
+  const delivered = await handOff(
+    () => { sends++; return server.notification({ method: 'notifications/claude/channel', params: { content: 'hi', meta: {} } }) },
+    error => { lost.push(String(error)) },
+    { isDead: () => out.destroyed || out.writableEnded, stream: out },
+  )
+  expect(delivered).toBe(false)
+  expect(sends).toBe(0)
+  expect(lost).toEqual(['Error: transport closed'])
+})
+
+test('a send that is waiting when shutdown starts gives up at once', async () => {
+  let markDying!: () => void
+  const dying = new Promise<void>(r => { markDying = r })
+  const lost: string[] = []
+  const started = Date.now()
+  const pending = handOff(() => new Promise(() => {}), e => { lost.push(String(e)) }, { dying, timeoutMs: 10_000 })
+  setTimeout(markDying, 20)
+  expect(await pending).toBe(false)
+  expect(lost).toEqual(['Error: transport closed'])
+  expect(Date.now() - started).toBeLessThan(1000)
+})
+
+test('a send accepted while the transport died counts as lost', async () => {
+  let dead = false
+  const lost: string[] = []
+  const ok = await handOff(async () => { dead = true }, e => { lost.push(String(e)) }, { isDead: () => dead })
+  expect(ok).toBe(false)
+  expect(lost).toEqual(['Error: transport closed while sending'])
 })
 
 test('a delivered hand-off runs nothing else, and a throwing onLost stays inside', async () => {

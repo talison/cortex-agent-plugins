@@ -31,6 +31,22 @@ test('a process that outlives the settle window claims once, then polls', async 
   expect(events).toEqual(['sleep 2000', 'claim', 'start'])
 })
 
+test('a claim that throws is reported and polling still starts', async () => {
+  // A failed bot.pid write rejected runPolling and left a live server with
+  // dead inbound (Fable review).
+  const events: string[] = []
+  await runPolling({
+    settleMs: 1,
+    sleep: async () => {},
+    onSettled: () => { throw new Error('EACCES') },
+    onSettledError: e => { events.push(`claim failed: ${(e as Error).message}`) },
+    start: async () => { events.push('start') },
+    isShuttingDown: () => false, isConflict: () => false,
+    onFailure: () => {}, onExhausted: () => {},
+  })
+  expect(events).toEqual(['claim failed: EACCES', 'start'])
+})
+
 test('the last word reaches every chat and never outlasts its timeout', async () => {
   const sent: string[] = []
   const started = Date.now()
