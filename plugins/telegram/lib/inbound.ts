@@ -93,3 +93,18 @@ export async function handOff(
     return false
   }
 }
+
+/**
+ * The onTimeout the server uses: destroy stdout synchronously, then shut
+ * down. Shutdown keeps the process up for up to 2 s to send notices, and a
+ * stalled pipe that drained in that window would still deliver the queued
+ * message, after "may not have reached" or a "Delivery failed" verdict that
+ * Claude Code would then act on (codex review). Destroying discards what is
+ * still buffered; bytes the kernel already took cannot be recalled.
+ */
+export function endOnStall(stdout: { destroy(): unknown }, shutdown: () => void): () => void {
+  return () => {
+    try { stdout.destroy() } catch {}
+    shutdown()
+  }
+}

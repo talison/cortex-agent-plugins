@@ -30,7 +30,7 @@ import { lastWord, runPolling } from './lib/polling.js'
 import { channelOwner } from './lib/owner.js'
 import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
-import { deliverBounded, handOff } from './lib/inbound.js'
+import { deliverBounded, endOnStall, handOff } from './lib/inbound.js'
 import { accessReader, isStaleAccess, outboundRefusal, writeAccessFile, type Access } from './lib/access.js'
 import { gate as accessGate, pruneExpired, type GateCtx, type GateResult } from './lib/gate.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
@@ -520,7 +520,7 @@ function transportDead(): boolean {
   return shuttingDown || process.stdin.readableEnded || process.stdout.destroyed || process.stdout.writableEnded
 }
 // A timed-out send is still queued on stdout: treat it as a dead transport.
-const BOUNDED = { isDead: transportDead, onDying, onTimeout: () => shutdown('stdout:stalled') }
+const BOUNDED = { isDead: transportDead, onDying, onTimeout: endOnStall(process.stdout, () => shutdown('stdout:stalled')) }
 // Permission verdicts go through the same bounds: a stalled send there held
 // the update loop just the same (Fable review). A rejection reaches the
 // callers' "Delivery failed" path and leaves the request pending.

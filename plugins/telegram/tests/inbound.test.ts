@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { PassThrough, Writable } from 'stream'
-import { handOff } from '../lib/inbound.ts'
+import { endOnStall, handOff } from '../lib/inbound.ts'
 
 const base = '../node_modules/@modelcontextprotocol/sdk/dist/esm'
 
@@ -76,6 +76,39 @@ test('a stdout that stalls past the timeout, then drains: the timeout ends the t
   await new Promise(r => setTimeout(r, 20))
   expect(events).toHaveLength(2)    // nothing further, no throw
   expect(dead).toBe(true)
+})
+
+test('a message queued behind a stalled write never arrives once the hand-off has timed out', async () => {
+  // Shutdown keeps the process up to send notices; if the pipe drained in
+  // that window the queued verdict reached Claude after "Delivery failed"
+  // (codex review). endOnStall destroys stdout before shutdown runs.
+  const { Server } = await import(`${base}/server/index.js`)
+  const { StdioServerTransport } = await import(`${base}/server/stdio.js`)
+  const written: string[] = []
+  let release: (() => void) | undefined
+  const out = new Writable({
+    highWaterMark: 1,
+    write(chunk, _e, cb) { written.push(String(chunk)); if (release) cb(); else release = cb },
+  })
+  out.on('error', () => {})
+  const server = new Server({ name: 't', version: '0' }, { capabilities: { experimental: { 'claude/channel': {} } } })
+  await server.connect(new StdioServerTransport(new PassThrough(), out))
+
+  // First write takes the pipe and stalls; the verdict queues behind it.
+  void server.notification({ method: 'notifications/claude/channel', params: { content: 'earlier', meta: {} } })
+  let shutdowns = 0
+  const delivered = await handOff(
+    () => server.notification({ method: 'notifications/claude/channel/permission', params: { request_id: 'abcde', behavior: 'allow' } }),
+    () => {},
+    { timeoutMs: 50, isDead: () => out.destroyed, onTimeout: endOnStall(out, () => { shutdowns++ }) },
+  )
+  expect(delivered).toBe(false)
+  expect(shutdowns).toBe(1)
+  expect(out.destroyed).toBe(true)
+  release!()                                   // the pipe drains late
+  await new Promise(r => setTimeout(r, 20))
+  expect(written).toHaveLength(1)
+  expect(written.join('')).not.toContain('abcde')
 })
 
 test('a stalled notice cannot hold the update loop either; its signal is aborted', async () => {
