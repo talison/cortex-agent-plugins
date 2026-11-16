@@ -32,8 +32,8 @@ import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
 import { deliverBounded, handOff } from './lib/inbound.js'
 import { accessReader, writeAccessFile, type Access } from './lib/access.js'
+import { gate as accessGate, pruneExpired, type GateCtx, type GateResult } from './lib/gate.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
 import { execFileSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
@@ -194,87 +194,18 @@ function assertAllowedChat(chat_id: string): void {
   throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
 }
 
-function saveAccess(a: Access): void {
-  if (STATIC) return
+function saveAccess(a: Access): boolean {
+  if (STATIC) return true
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  writeAccessFile(ACCESS_FILE, a, msg => debugLog(msg))
+  return writeAccessFile(ACCESS_FILE, a, msg => debugLog(msg))
 }
-
-function pruneExpired(a: Access): boolean {
-  const now = Date.now()
-  let changed = false
-  for (const [code, p] of Object.entries(a.pending)) {
-    if (p.expiresAt < now) {
-      delete a.pending[code]
-      changed = true
-    }
-  }
-  return changed
-}
-
-type GateResult =
-  | { action: 'deliver'; access: Access }
-  | { action: 'drop' }
-  | { action: 'pair'; code: string; isResend: boolean }
 
 function gate(ctx: Context): GateResult {
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-
-  const from = ctx.from
-  if (!from) return { action: 'drop' }
-  const senderId = String(from.id)
-  const chatType = ctx.chat?.type
-
-  if (chatType === 'private') {
-    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
-    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-
-    // pairing mode — check for existing non-expired code for this sender
-    for (const [code, p] of Object.entries(access.pending)) {
-      if (p.senderId === senderId) {
-        // Reply twice max (initial + one reminder), then go silent.
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-        p.replies = (p.replies ?? 1) + 1
-        saveAccess(access)
-        return { action: 'pair', code, isResend: true }
-      }
-    }
-    // Cap pending at 3. Extra attempts are silently dropped.
-    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
-
-    const code = randomBytes(3).toString('hex') // 6 hex chars
-    const now = Date.now()
-    access.pending[code] = {
-      senderId,
-      chatId: String(ctx.chat!.id),
-      createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
-      replies: 1,
-    }
-    saveAccess(access)
-    return { action: 'pair', code, isResend: false }
-  }
-
-  if (chatType === 'group' || chatType === 'supergroup') {
-    const groupId = String(ctx.chat!.id)
-    const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
-    const groupAllowFrom = policy.allowFrom ?? []
-    const requireMention = policy.requireMention ?? true
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
-    }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns, botUsername)) {
-      return { action: 'drop' }
-    }
-    return { action: 'deliver', access }
-  }
-
-  return { action: 'drop' }
+  return accessGate(ctx as GateCtx, {
+    load: loadAccess,
+    save: saveAccess,
+    mentioned: (_c, patterns) => isMentioned(ctx, patterns, botUsername),
+  })
 }
 
 // Like gate() but for bot commands: no pairing side effects, just allow/drop.
@@ -565,8 +496,12 @@ await mcp.connect(new StdioServerTransport())
 let shuttingDown = false
 // Settles when shutdown starts: a hand-off still waiting on the transport
 // gives up at once, so its "may not have reached" notice can still go out.
-let markDying: () => void = () => {}
-const dying = new Promise<void>(resolve => { markDying = resolve })
+const dyingCallbacks = new Set<() => void>()
+function onDying(cb: () => void): () => void {
+  if (shuttingDown) { cb(); return () => {} }
+  dyingCallbacks.add(cb)
+  return () => { dyingCallbacks.delete(cb) }
+}
 // Hand-offs (and their notices) in progress; shutdown waits for them, bounded.
 const inflight = new Set<Promise<unknown>>()
 function track<T>(p: Promise<T>): Promise<T> {
@@ -578,7 +513,7 @@ function track<T>(p: Promise<T>): Promise<T> {
 function transportDead(): boolean {
   return shuttingDown || process.stdin.readableEnded || process.stdout.destroyed || process.stdout.writableEnded
 }
-const BOUNDED = { isDead: transportDead, dying, stream: process.stdout }
+const BOUNDED = { isDead: transportDead, onDying }
 // Permission verdicts go through the same bounds: a stalled send there held
 // the update loop just the same (Fable review). A rejection reaches the
 // callers' "Delivery failed" path and leaves the request pending.
@@ -588,7 +523,7 @@ const sendPermissionVerdict = (params: { request_id: string; behavior: 'allow' |
 function shutdown(trigger: string, exitCode = 0): void {
   if (shuttingDown) return
   shuttingDown = true
-  markDying()
+  for (const cb of [...dyingCallbacks]) cb()
   const uptime = Math.round((Date.now() - startedAt) / 1000)
   debugLog(`shutdown trigger=${trigger} uptime=${uptime}s`)
   process.stderr.write(`telegram channel: shutting down (${trigger}, uptime=${uptime}s)\n`)
@@ -956,11 +891,11 @@ async function handleInbound(
         meta: buildChannelMeta(ctx, imagePath, attachment),
       },
     }),
-    async err => {
+    async (err, signal) => {
       process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
       debugLog('inbound hand-off failed', { error: String(err), chat_id, message_id: msgId })
       stopTyping(chat_id)
-      await ctx.reply('⚠️ That message may not have reached the session (it may be restarting). Please send it again in a minute.')
+      await ctx.reply('⚠️ That message may not have reached the session (it may be restarting). Please send it again in a minute.', undefined, signal as Parameters<typeof ctx.reply>[2])
     },
     BOUNDED,
   ))

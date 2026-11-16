@@ -1,20 +1,20 @@
-import type { EventEmitter } from 'events'
-
 export type BoundedOpts = {
   /** Give up after this long. The SDK's stdio send resolves only on 'drain'. */
   timeoutMs?: number
   /** True once the transport cannot carry a message: shutting down, stdin or stdout ended. */
   isDead?: () => boolean
-  /** Settles when the process starts shutting down, so a stalled send gives up at once. */
-  dying?: Promise<unknown>
-  /** The transport's stdout: 'drain' listeners an abandoned send left on it are removed. */
-  stream?: EventEmitter
+  /**
+   * Subscribe to the start of shutdown, so a stalled send gives up at once;
+   * returns the unsubscribe, called when the send settles (a subscription
+   * per send left on a shared promise grew until shutdown: codex review).
+   */
+  onDying?: (cb: () => void) => () => void
 }
 
 /**
  * Deliver one MCP message to Claude, or reject. It rejects when the transport
- * is already dead, when it dies (or `dying` settles) while the send waits,
- * after `timeoutMs`, and when the send is accepted but the transport died
+ * is already dead, when shutdown starts while the send waits, after
+ * `timeoutMs`, and when the send is accepted but the transport died
  * meanwhile, since whether Claude read it is then unknown.
  *
  * Why: the SDK's StdioServerTransport.send never rejects; it resolves on
@@ -23,31 +23,28 @@ export type BoundedOpts = {
  * (codex review). During a restart the process exits within seconds of
  * stdin's end, so the dead checks, not the timeout, are what let the sender
  * hear about it (Fable review).
+ *
+ * An abandoned send leaves the SDK's once('drain') listener on stdout. It is
+ * not removed: from out here it cannot be told apart from a concurrent send's
+ * listener (a tool result), and removing that one strands its response
+ * (codex review). It only happens with stdout stalled, which ends the session.
  */
 export async function deliverBounded(deliver: () => Promise<void>, opts: BoundedOpts = {}): Promise<void> {
-  const { timeoutMs = 10_000, isDead = () => false, dying, stream } = opts
+  const { timeoutMs = 10_000, isDead = () => false, onDying } = opts
   if (isDead()) throw new Error('transport closed')
-  const drainBefore = new Set(stream?.listeners('drain') ?? [])
   let timer: ReturnType<typeof setTimeout> | undefined
-  // Handled here too: it rejects at shutdown even for sends long finished.
-  const died = dying?.then(() => { throw new Error('transport closed') })
-  died?.catch(() => {})
+  let unsubscribe = () => {}
   try {
     await Promise.race([
       deliver(),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(`hand-off timed out after ${timeoutMs} ms`)), timeoutMs)
+        if (onDying) unsubscribe = onDying(() => reject(new Error('transport closed')))
       }),
-      ...(died ? [died] : []),
     ])
-  } catch (error) {
-    // The abandoned send's once('drain') would otherwise stay on stdout.
-    for (const l of stream?.listeners('drain') ?? []) {
-      if (!drainBefore.has(l)) stream!.removeListener('drain', l as (...a: unknown[]) => void)
-    }
-    throw error
   } finally {
     clearTimeout(timer)
+    unsubscribe()
   }
   if (isDead()) throw new Error('transport closed while sending')
 }
@@ -57,18 +54,31 @@ export async function deliverBounded(deliver: () => Promise<void>, opts: Bounded
  * whatever the handler does, so a lost hand-off loses the message: it was
  * fire-and-forget with a stderr line nobody reads (2026-11-16 audit, finding
  * 4). Now a failure (deliverBounded) runs `onLost` — log it and tell the
- * sender it may not have arrived — which never throws into the update loop.
+ * sender it may not have arrived — which never throws into the update loop,
+ * and is itself bounded: grammy's request timeout is 500 s, so a stalled
+ * notice would hold the loop too (codex review). Its signal aborts at the bound.
  */
 export async function handOff(
   deliver: () => Promise<void>,
-  onLost: (error: unknown) => Promise<void> | void,
-  opts: BoundedOpts = {},
+  onLost: (error: unknown, signal: AbortSignal) => Promise<void> | void,
+  opts: BoundedOpts & { noticeTimeoutMs?: number } = {},
 ): Promise<boolean> {
   try {
     await deliverBounded(deliver, opts)
     return true
   } catch (error) {
-    try { await onLost(error) } catch {}
+    const abort = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => onLost(error, abort.signal)),
+        new Promise<void>(resolve => {
+          timer = setTimeout(() => { abort.abort(); resolve() }, opts.noticeTimeoutMs ?? 5_000)
+        }),
+      ])
+    } catch {} finally {
+      clearTimeout(timer)
+    }
     return false
   }
 }
