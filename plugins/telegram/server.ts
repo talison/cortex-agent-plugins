@@ -30,6 +30,7 @@ import { lastWord, runPolling } from './lib/polling.js'
 import { channelOwner } from './lib/owner.js'
 import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
+import { handOff } from './lib/inbound.js'
 import { accessReader, type Access } from './lib/access.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
@@ -37,6 +38,10 @@ import { execFileSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+
+// The MCP handshake reports package.json's version: a hand-kept copy here
+// said fork.7 while the plugin shipped fork.9 (2026-11-16 audit, finding 13).
+const PLUGIN_VERSION: string = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -140,6 +145,18 @@ function assertSendable(f: string): void {
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
   }
+}
+
+// Both download paths: bounded, and an error status is an error rather than
+// a body saved as the file. The photo path had neither, so a hung fetch held
+// the update loop and an error page became the "image" (2026-11-16 audit,
+// finding 13).
+async function fetchTelegramFile(filePath: string): Promise<Buffer> {
+  const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${filePath}`, {
+    signal: AbortSignal.timeout(60_000),
+  })
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  return Buffer.from(await res.arrayBuffer())
 }
 
 const readAccessFile = accessReader(ACCESS_FILE, (msg, ctx) => {
@@ -303,10 +320,12 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+// Owner only: every session's instance polled approved/, so one pairing could
+// be confirmed once per open session (2026-11-16 audit, finding 13).
+if (!STATIC && OWNER.owner) setInterval(checkApprovals, 5000).unref()
 
 const mcp = new Server(
-  { name: 'telegram', version: '0.1.0-fork.7' },
+  { name: 'telegram', version: PLUGIN_VERSION },
   {
     capabilities: {
       tools: {},
@@ -367,6 +386,7 @@ if (OWNER.owner) mcp.setNotificationHandler(
     for (const chat_id of access.allowFrom) {
       void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
         process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
+        debugLog('permission_request send failed', { chat_id, error: String(e) })
       })
     }
   },
@@ -500,10 +520,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const file_id = args.file_id as string
         const file = await bot.api.getFile(file_id)
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = Buffer.from(await res.arrayBuffer())
+        const buf = await fetchTelegramFile(file.file_path)
         // file_path is from Telegram (trusted), but strip to safe chars anyway
         // so nothing downstream can be tricked by an unexpected extension.
         const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
@@ -736,9 +753,7 @@ bot.on('message:photo', async ctx => {
     try {
       const file = await ctx.api.getFile(best.file_id)
       if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url)
-      const buf = Buffer.from(await res.arrayBuffer())
+      const buf = await fetchTelegramFile(file.file_path)
       const ext = file.file_path.split('.').pop() ?? 'jpg'
       const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
       mkdirSync(INBOX_DIR, { recursive: true })
@@ -746,6 +761,7 @@ bot.on('message:photo', async ctx => {
       return path
     } catch (err) {
       process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
+      debugLog('photo download failed', { error: String(err) })
       return undefined
     }
   })
@@ -894,15 +910,23 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: buildChannelMeta(ctx, imagePath, attachment),
+  // Telegram has the update confirmed whatever happens here, so a lost
+  // hand-off is logged and the sender asked to resend (lib/inbound.ts).
+  await handOff(
+    () => mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: text,
+        meta: buildChannelMeta(ctx, imagePath, attachment),
+      },
+    }),
+    async err => {
+      process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+      debugLog('inbound hand-off failed', { error: String(err), chat_id, message_id: msgId })
+      stopTyping(chat_id)
+      await ctx.reply('⚠️ That message did not reach the session (it may be restarting). Please send it again in a minute.')
     },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  )
 }
 
 // Without this, any throw in a message handler stops polling permanently
