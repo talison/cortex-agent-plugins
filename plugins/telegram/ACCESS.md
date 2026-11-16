@@ -6,6 +6,8 @@ By default, a DM from an unknown sender triggers **pairing**: the bot replies wi
 
 All state lives in `~/.claude/channels/telegram/access.json`. The `/telegram:access` skill commands edit this file; the server re-reads it on every inbound message, so changes take effect without a restart. Set `TELEGRAM_ACCESS_MODE=static` to pin config to what was on disk at boot (pairing is unavailable in static mode since it requires runtime writes).
 
+**If `access.json` cannot be read** (a hand edit left invalid JSON, a permissions change), the server retries the first failed read briefly, in case a rewrite is in progress. If it still fails, the server keeps using the last good read for about 60 seconds. During that time it pairs nobody and never writes the file, and the session that owns the bot sends one warning to the allowlisted chats. After that it fails closed: `dmPolicy` acts as `disabled`, inbound is dropped, and outbound tools answer "access.json is unreadable; fix the file". A server with no good read since it started fails closed at once. The file is never renamed or rewritten by a read, and the server recovers on the first read that parses. Each change of state is logged to `~/.claude/channels/telegram/logs/fork-debug.log`.
+
 ## At a glance
 
 | | |

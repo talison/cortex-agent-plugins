@@ -52,3 +52,17 @@ test('a refused save hands out no code', () => {
   const { deps } = setup(PAIRING)
   expect(gate(stranger, { ...deps, save: () => false })).toEqual({ action: 'drop' })
 })
+
+test('a stale stand-in with expired pending entries is not prune-saved on every message', () => {
+  // The stand-in is the last good read as parsed, expired entry included, so
+  // every stale read pruned it again and logged a refused save (Fable review).
+  const expired = { old: { senderId: '5', chatId: '5', createdAt: 0, expiresAt: 1, replies: 1 } }
+  const { file, deps } = setup({ ...PAIRING, pending: expired })
+  let saves = 0
+  const counting = { ...deps, save: (a: Parameters<typeof deps.save>[0]) => { saves++; return deps.save(a) } }
+  expect(gate(tom, counting).action).toBe('deliver')   // a good read: pruned and saved
+  expect(saves).toBe(1)
+  writeFileSync(file, '{"broken"')
+  for (let i = 0; i < 3; i++) expect(gate(tom, counting).action).toBe('deliver')
+  expect(saves).toBe(1)
+})

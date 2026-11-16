@@ -43,7 +43,8 @@ export function gate(ctx: GateCtx, deps: GateDeps): GateResult {
   const now = deps.now ?? Date.now
   const access = deps.load()
   const pruned = pruneExpired(access, now())
-  if (pruned) deps.save(access)
+  // A stale stand-in is never saved; pruning it would only log a refusal per message.
+  if (pruned && !isStaleAccess(access)) deps.save(access)
 
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
 

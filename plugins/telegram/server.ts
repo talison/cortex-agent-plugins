@@ -31,7 +31,7 @@ import { channelOwner } from './lib/owner.js'
 import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
 import { deliverBounded, handOff } from './lib/inbound.js'
-import { accessReader, writeAccessFile, type Access } from './lib/access.js'
+import { accessReader, isStaleAccess, outboundRefusal, writeAccessFile, type Access } from './lib/access.js'
 import { gate as accessGate, pruneExpired, type GateCtx, type GateResult } from './lib/gate.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { execFileSync } from 'child_process'
@@ -162,6 +162,14 @@ async function fetchTelegramFile(filePath: string): Promise<Buffer> {
 const readAccessFile = accessReader(ACCESS_FILE, (msg, ctx) => {
   process.stderr.write(`telegram channel: ${msg}\n`)
   debugLog(msg, ctx)
+}, {
+  // One warning per failure streak, from the owner only, before inbound
+  // fails closed; otherwise the drop is silent both ways (Fable review).
+  onStale: lastGood => {
+    if (!OWNER.owner) return
+    void lastWord((chat, text) => bot.api.sendMessage(chat, text), lastGood.allowFrom,
+      `⚠️ The Telegram plugin cannot read ${ACCESS_FILE}. Inbound stops in about 60 s unless the file is fixed.`, 5000)
+  },
 })
 
 // In static mode, access is snapshotted at boot and never re-read or written.
@@ -188,10 +196,8 @@ function loadAccess(): Access {
 // Outbound gate — reply/react/edit can only target chats the inbound gate
 // would deliver from. Telegram DM chat_id == user_id, so allowFrom covers DMs.
 function assertAllowedChat(chat_id: string): void {
-  const access = loadAccess()
-  if (access.allowFrom.includes(chat_id)) return
-  if (chat_id in access.groups) return
-  throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
+  const refusal = outboundRefusal(loadAccess(), chat_id, ACCESS_FILE)
+  if (refusal) throw new Error(refusal)
 }
 
 function saveAccess(a: Access): boolean {
@@ -217,7 +223,7 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
   const senderId = String(ctx.from.id)
   const access = loadAccess()
   const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
+  if (pruned && !isStaleAccess(access)) saveAccess(access)
   if (access.dmPolicy === 'disabled') return null
   if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
   return { access, senderId }
@@ -513,7 +519,8 @@ function track<T>(p: Promise<T>): Promise<T> {
 function transportDead(): boolean {
   return shuttingDown || process.stdin.readableEnded || process.stdout.destroyed || process.stdout.writableEnded
 }
-const BOUNDED = { isDead: transportDead, onDying }
+// A timed-out send is still queued on stdout: treat it as a dead transport.
+const BOUNDED = { isDead: transportDead, onDying, onTimeout: () => shutdown('stdout:stalled') }
 // Permission verdicts go through the same bounds: a stalled send there held
 // the update loop just the same (Fable review). A rejection reaches the
 // callers' "Delivery failed" path and leaves the request pending.
@@ -806,7 +813,27 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
-async function handleInbound(
+// The whole handler is tracked, so shutdown also waits (bounded) for one
+// still downloading a photo, not only for the hand-off (Fable review).
+function handleInbound(
+  ctx: Context,
+  text: string,
+  downloadImage: (() => Promise<string | undefined>) | undefined,
+  attachment?: AttachmentMeta,
+): Promise<void> {
+  return track(handleInboundTracked(ctx, text, downloadImage, attachment))
+}
+
+// Settles with undefined if shutdown starts first, so the hand-off below
+// finds the transport dead and the sender is told, instead of the process
+// exiting mid-download.
+function untilDying<T>(p: Promise<T>): Promise<T | undefined> {
+  let unsubscribe = () => {}
+  const died = new Promise<undefined>(resolve => { unsubscribe = onDying(() => resolve(undefined)) })
+  return Promise.race([p, died]).finally(() => unsubscribe())
+}
+
+async function handleInboundTracked(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
@@ -877,13 +904,13 @@ async function handleInbound(
       .catch(() => {})
   }
 
-  const imagePath = downloadImage ? await downloadImage() : undefined
+  const imagePath = downloadImage && !transportDead() ? await untilDying(downloadImage()) : undefined
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   // Telegram has the update confirmed whatever happens here, so a lost
   // hand-off is logged and the sender asked to resend (lib/inbound.ts).
-  await track(handOff(
+  await handOff(
     () => mcp.notification({
       method: 'notifications/claude/channel',
       params: {
@@ -898,7 +925,7 @@ async function handleInbound(
       await ctx.reply('⚠️ That message may not have reached the session (it may be restarting). Please send it again in a minute.', undefined, signal as Parameters<typeof ctx.reply>[2])
     },
     BOUNDED,
-  ))
+  )
 }
 
 // Without this, any throw in a message handler stops polling permanently

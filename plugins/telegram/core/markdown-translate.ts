@@ -12,8 +12,10 @@ const V2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
 
 /**
  * In prose, outside code, one of:
- *  1. a backslash escape: a backslash before a reserved character or another
- *     backslash (`snake\_case`, `v1\.2`, `\*not italic\*`, `\\`). Escaping it
+ *  1. a backslash escape: a backslash before any ASCII punctuation, as
+ *     CommonMark has it (`snake\_case`, `v1\.2`, `\*not italic\*`, `\\`,
+ *     `\$5`, `\<tag\>`; MarkdownV2 accepts an escape of any character 1-126,
+ *     and a reserved-only set left `\$5` showing its backslash). Escaping it
  *     again gave `\\_`, an escaped backslash and a bare `_`, which Telegram
  *     rejected, so the chunk went out plain. It is already valid MarkdownV2
  *     for the literal character, so it is parked as-is before any syntax is
@@ -24,7 +26,7 @@ const V2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
  * Any other backslash (`\d`, `C:\temp`, a trailing one) is a literal and is
  * escaped by the passes below.
  */
-const PROSE_TOKEN_RE = /\\([_*[\]()~`>#+\-=|{}.!\\])|\\\n|`([^`\n]+)`/g;
+const PROSE_TOKEN_RE = /\\([!-\/:-@\[-`{-~])|\\\n|`([^`\n]+)`/g;
 
 /** Matches only the `)` and `\` characters — the v2 rule for link URL escaping. */
 const V2_URL_ESCAPE = /[\\)]/g;

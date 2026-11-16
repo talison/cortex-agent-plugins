@@ -125,6 +125,23 @@ After eight consecutive polling conflicts (HTTP 409), the plugin shuts down
 its MCP server as well as polling, with a nonzero exit status. This intentionally replaces the former
 state where tools remained available while inbound polling had stopped.
 Resolve the competing bot poller and restart the session to restore the channel.
+Before it exits, it sends one notice, bounded at 5 seconds, to the allowlisted
+chats: inbound may have stopped, and here is how to restart the session.
+
+Polling starts about 2 seconds after the server does. Claude Code sometimes
+spawns a short-lived duplicate server that loses stdin within milliseconds.
+The settle window lets it exit before it can claim `bot.pid` and stop the live
+poller.
+
+Each inbound message is handed to Claude with a bound. If the session's end
+of the pipe is gone or closing, or the hand-off takes longer than 10 seconds,
+the sender gets "That message may not have reached the session … Please send
+it again". Telegram counts the message as delivered either way. A hand-off
+that times out means stdout has stalled, so the server shuts down, and a late
+write cannot arrive after that notice. Shutdown waits up to 2 seconds for a
+hand-off and its notice to finish.
+
+What happens when `access.json` cannot be read is in ACCESS.md.
 
 An invalid bot token (HTTP 401) also terminates the process with a nonzero status;
 update the token and restart the session instead of retrying a fixed credential

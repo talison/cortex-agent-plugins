@@ -46,6 +46,38 @@ test('a stdio transport whose stdout never drains cannot hold the update loop', 
   expect(Date.now() - started).toBeLessThan(2000)
 })
 
+test('a stdout that stalls past the timeout, then drains: the timeout ends the transport first', async () => {
+  // The write is queued before the wait, so it arrives once the pipe drains:
+  // after the sender was told to resend, or a verdict retried the other way.
+  // A timeout therefore calls onTimeout, which the server wires to
+  // shutdown('stdout:stalled') (Fable review).
+  const { Server } = await import(`${base}/server/index.js`)
+  const { StdioServerTransport } = await import(`${base}/server/stdio.js`)
+  const written: string[] = []
+  let release: (() => void) | undefined
+  const out = new Writable({
+    highWaterMark: 1,
+    write(chunk, _e, cb) { written.push(String(chunk)); release = cb },   // held until released
+  })
+  const server = new Server({ name: 't', version: '0' }, { capabilities: { experimental: { 'claude/channel': {} } } })
+  await server.connect(new StdioServerTransport(new PassThrough(), out))
+
+  const events: string[] = []
+  let dead = false
+  const delivered = await handOff(
+    () => server.notification({ method: 'notifications/claude/channel', params: { content: 'hi', meta: {} } }),
+    e => { events.push(`lost: ${String(e)}`) },
+    { timeoutMs: 50, isDead: () => dead, onTimeout: () => { dead = true; events.push('transport ended') } },
+  )
+  expect(delivered).toBe(false)
+  expect(events).toEqual(['transport ended', 'lost: Error: hand-off timed out after 50 ms'])
+  expect(written).toHaveLength(1)   // queued before the wait: why the transport must end
+  release?.()                       // the pipe drains late
+  await new Promise(r => setTimeout(r, 20))
+  expect(events).toHaveLength(2)    // nothing further, no throw
+  expect(dead).toBe(true)
+})
+
 test('a stalled notice cannot hold the update loop either; its signal is aborted', async () => {
   // grammy's request timeout is 500 s, so an unbounded ctx.reply in onLost
   // stalled every later update (codex review).

@@ -66,6 +66,19 @@ export function writeAccessFile(file: string, a: Access, log: (msg: string) => v
   return true
 }
 
+/**
+ * Why a reply/react/edit to `chatId` is refused, or null when it is allowed.
+ * While access.json is unreadable the allowlist message was wrong and steered
+ * Claude to the access skill, which reads and rewrites the broken file
+ * (Fable review): the refusal names the file instead.
+ */
+export function outboundRefusal(access: Access, chatId: string, file: string): string | null {
+  if (access.allowFrom.includes(chatId)) return null
+  if (chatId in access.groups) return null
+  if (isStaleAccess(access)) return `access.json is unreadable; fix the file (${file}), then retry`
+  return `chat ${chatId} is not allowlisted — add via /telegram:access`
+}
+
 function markStale(a: Access): Access {
   stale.add(a)
   return a
@@ -83,6 +96,11 @@ export type AccessReaderOpts = {
   staleWindowMs?: number
   now?: () => number
   sleep?: (ms: number) => void
+  /**
+   * Called once when a failure streak starts serving the last good read,
+   * with that read: the owner warns its allowlist before inbound fails closed.
+   */
+  onStale?: (lastGood: Access, error: unknown) => void
 }
 
 /**
@@ -91,7 +109,9 @@ export type AccessReaderOpts = {
  * Any other failure used to move the file aside and fall back to pairing
  * with an empty allowlist: Tom's own DMs got "Pairing required" and the
  * allowlist sat in a `.corrupt-*` file (2026-11-16 audit, finding 10). Now:
- *  - a failed read is retried briefly, which covers a rewrite in progress;
+ *  - the first failed read is retried briefly, which covers a rewrite in
+ *    progress; later reads of a known-bad file try once, never blocking the
+ *    event loop on every read (Fable review);
  *  - a failure that persists serves the last good read, marked stale (never
  *    saved), for at most `staleWindowMs` from the first failure;
  *  - after that, or with no good read in this process, it fails closed:
@@ -133,7 +153,8 @@ export function accessReader(
 
   return () => {
     let error: unknown
-    for (let i = 0; i < attempts; i++) {
+    const tries = failingSince === undefined ? attempts : 1
+    for (let i = 0; i < tries; i++) {
       if (i > 0) sleep(retryMs)
       try {
         const access = parse()
@@ -158,6 +179,7 @@ export function accessReader(
       if (reported !== 'stale') {
         log('access.json unreadable: serving the last good read (not saved)', { error: String(error) })
         reported = 'stale'
+        try { opts.onStale?.(structuredClone(lastGood), error) } catch {}
       }
       return markStale(structuredClone(lastGood))
     }

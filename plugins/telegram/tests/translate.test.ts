@@ -142,6 +142,11 @@ test('backslash edge cases follow CommonMark (Fable review)', () => {
   // A backslash before a newline is a hard break: just the newline.
   expect(claudeToTelegramV2('line one\\\nline two')).toBe('line one\nline two')
   expect(shown('two\\\\\nlines')).toBe('two\\\nlines')
+  // Any ASCII punctuation can be escaped, not only MarkdownV2's reserved set:
+  // `\$5` showed its backslash (Fable review).
+  expect(claudeToTelegramV2('costs \\$5')).toBe('costs \\$5')
+  expect(shown('costs \\$5')).toBe('costs $5')
+  expect(shown('\\<x\\> and \\"q\\" and \\@me')).toBe('<x> and "q" and @me')
   // A pre-escape inside a link URL stays a valid URL escape.
   expect(claudeToTelegramV2('[docs](https://x.example/a\\_b)')).toBe('[docs](https://x.example/a\\_b)')
   expect(claudeToTelegramV2('[docs](https://x.example/a\\.b)')).toBe('[docs](https://x.example/a\\.b)')

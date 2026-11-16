@@ -9,6 +9,13 @@ export type BoundedOpts = {
    * per send left on a shared promise grew until shutdown: codex review).
    */
   onDying?: (cb: () => void) => () => void
+  /**
+   * Called when `timeoutMs` passes. The write is already queued on stdout and
+   * would still arrive if the pipe recovered, after the sender was told to
+   * resend (a duplicate) or a permission verdict was retried the other way;
+   * the server treats a timeout as a dead transport and shuts down (Fable review).
+   */
+  onTimeout?: () => void
 }
 
 /**
@@ -27,10 +34,11 @@ export type BoundedOpts = {
  * An abandoned send leaves the SDK's once('drain') listener on stdout. It is
  * not removed: from out here it cannot be told apart from a concurrent send's
  * listener (a tool result), and removing that one strands its response
- * (codex review). It only happens with stdout stalled, which ends the session.
+ * (codex review). It only happens with stdout stalled, which ends the session
+ * (onTimeout).
  */
 export async function deliverBounded(deliver: () => Promise<void>, opts: BoundedOpts = {}): Promise<void> {
-  const { timeoutMs = 10_000, isDead = () => false, onDying } = opts
+  const { timeoutMs = 10_000, isDead = () => false, onDying, onTimeout } = opts
   if (isDead()) throw new Error('transport closed')
   let timer: ReturnType<typeof setTimeout> | undefined
   let unsubscribe = () => {}
@@ -38,7 +46,10 @@ export async function deliverBounded(deliver: () => Promise<void>, opts: Bounded
     await Promise.race([
       deliver(),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`hand-off timed out after ${timeoutMs} ms`)), timeoutMs)
+        timer = setTimeout(() => {
+          reject(new Error(`hand-off timed out after ${timeoutMs} ms`))
+          onTimeout?.()
+        }, timeoutMs)
         if (onDying) unsubscribe = onDying(() => reject(new Error('transport closed')))
       }),
     ])

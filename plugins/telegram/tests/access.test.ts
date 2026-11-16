@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { accessReader, isStaleAccess, writeAccessFile, type AccessReaderOpts } from '../lib/access.ts'
+import { accessReader, isStaleAccess, outboundRefusal, writeAccessFile, type Access, type AccessReaderOpts } from '../lib/access.ts'
 
 const dirs: string[] = []
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }) })
@@ -120,4 +120,49 @@ test('the last good read is a copy, so a caller mutating it cannot change it', (
   writeFileSync(f.file, 'not json')
   f.read().allowFrom.push('888')
   expect(f.read().allowFrom).toEqual(['111'])
+})
+
+test('only the first failed read retries; later reads of a known-bad file never block (default sleeper)', () => {
+  // Three tries 50 ms apart on every read blocked the event loop for 100 ms
+  // each time, a reply reading twice (Fable review). Real Atomics.wait here.
+  const f = fixture({ sleep: undefined })
+  writeFileSync(f.file, TOM)
+  f.read()
+  writeFileSync(f.file, 'not json')
+  let t = performance.now()
+  expect(f.read().allowFrom).toEqual(['111'])
+  const first = performance.now() - t
+  t = performance.now()
+  for (let i = 0; i < 5; i++) f.read()
+  const nextFive = performance.now() - t
+  expect(first).toBeGreaterThanOrEqual(90)
+  expect(nextFive).toBeLessThan(first)
+})
+
+test('entering the stand-in warns once per failure streak, with the last good allowlist', () => {
+  const warned: string[][] = []
+  const f = fixture({ onStale: (a: Access) => { warned.push(a.allowFrom) } })
+  writeFileSync(f.file, TOM)
+  f.read()
+  writeFileSync(f.file, 'not json')
+  f.read(); f.read(); f.advance(61_000); f.read()
+  expect(warned).toEqual([['111']])
+  writeFileSync(f.file, TOM)
+  f.read()
+  writeFileSync(f.file, 'broken again')
+  f.read()
+  expect(warned).toEqual([['111'], ['111']])
+})
+
+test('an outbound refusal names the unreadable file, not the allowlist', () => {
+  // "not allowlisted — add via /telegram:access" steered Claude to the skill,
+  // which reads and rewrites the broken file (Fable review).
+  const f = fixture()
+  writeFileSync(f.file, TOM)
+  expect(outboundRefusal(f.read(), '111', f.file)).toBeNull()
+  expect(outboundRefusal(f.read(), '222', f.file)).toBe('chat 222 is not allowlisted — add via /telegram:access')
+  writeFileSync(f.file, 'not json')
+  expect(outboundRefusal(f.read(), '111', f.file)).toBeNull()   // the stand-in still lets Tom's replies through
+  f.advance(61_000)
+  expect(outboundRefusal(f.read(), '111', f.file)).toBe(`access.json is unreadable; fix the file (${f.file}), then retry`)
 })
