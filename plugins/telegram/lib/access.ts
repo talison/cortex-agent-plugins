@@ -70,7 +70,12 @@ export function accessReader(
       lastGood = structuredClone(access)
       return access
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        // A removed file is a reset: a later bad read must not bring back
+        // the allowlist it had (codex review).
+        lastGood = undefined
+        return defaultAccess()
+      }
       if (lastGood) {
         log('access.json unreadable, serving the last good read', { error: String(err) })
         return structuredClone(lastGood)

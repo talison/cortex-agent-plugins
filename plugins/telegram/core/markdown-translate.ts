@@ -10,9 +10,12 @@
 const V2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
 
 /**
- * An LLM's defensive pre-escape (`snake\_case`, `v1\.2`) in prose. Escaping it
- * again gave `\\_`, an escaped backslash and a bare `_`, which Telegram
- * rejected, so the chunk went out plain. It reads as the character itself.
+ * An escaped reserved character in prose (`snake\_case`, `v1\.2`, `\*not
+ * italic\*`). Escaping it again gave `\\_`, an escaped backslash and a bare
+ * `_`, which Telegram rejected, so the chunk went out plain. It is already
+ * valid MarkdownV2 for the literal character, so it is parked as-is before
+ * any syntax is recognised: it reads as the character and never becomes a
+ * delimiter.
  */
 const PRE_ESCAPE = /\\([_*[\]()~`>#+\-=|{}.!])/g;
 
@@ -109,9 +112,9 @@ export function claudeToTelegramV2(text: string): string {
   // 1b. Inline code.
   text = text.replace(INLINE_CODE_RE, (_m, body: string) => makePh('`' + escapeCode(body) + '`'));
 
-  // Outside code, a pre-escaped reserved character is the character itself;
-  // every escape pass below then escapes it, and any other backslash, once.
-  text = text.replace(PRE_ESCAPE, '$1');
+  // Outside code, an escaped reserved character is parked as the literal it
+  // already is; the escape passes below then escape any other backslash once.
+  text = text.replace(PRE_ESCAPE, (m) => makePh(m));
 
   // 1c. Links [text](url). Per v2 spec: link text escapes the full reserved
   //     set; URL escapes only `)` and `\`.

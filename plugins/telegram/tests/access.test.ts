@@ -66,3 +66,14 @@ test('a file that never parsed is moved aside as before, and a missing one is th
   expect(existsSync(f.file)).toBe(false)
   expect(readdirSync(f.dir).some(n => n.startsWith('access.json.corrupt-'))).toBe(true)
 })
+
+test('a removed file is a reset: a bad file after it does not bring the old allowlist back', () => {
+  // valid -> missing -> malformed served ['111'] again (codex review).
+  const f = fixture()
+  writeFileSync(f.file, TOM)
+  expect(f.read().allowFrom).toEqual(['111'])
+  rmSync(f.file)
+  expect(f.read().allowFrom).toEqual([])
+  writeFileSync(f.file, 'not json')
+  expect(f.read().allowFrom).toEqual([])
+})

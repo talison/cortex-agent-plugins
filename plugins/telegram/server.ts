@@ -924,7 +924,7 @@ async function handleInbound(
       process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
       debugLog('inbound hand-off failed', { error: String(err), chat_id, message_id: msgId })
       stopTyping(chat_id)
-      await ctx.reply('⚠️ That message did not reach the session (it may be restarting). Please send it again in a minute.')
+      await ctx.reply('⚠️ That message may not have reached the session (it may be restarting). Please send it again in a minute.')
     },
   )
 }

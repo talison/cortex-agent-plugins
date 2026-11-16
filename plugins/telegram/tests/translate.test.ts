@@ -114,6 +114,20 @@ test('an LLM pre-escape in prose is normalised, not doubled into a parse error',
   }
 })
 
+test('an escaped delimiter stays a literal character, never markup', () => {
+  // Normalising `\*` to `*` before syntax recognition turned `\*literal\*`
+  // into italics and `\> text` into a blockquote (codex review). They are
+  // parked as the MarkdownV2 escapes they already are.
+  expect(claudeToTelegramV2('\\*literal\\*')).toBe('\\*literal\\*')
+  expect(claudeToTelegramV2('\\> not a quote')).toBe('\\> not a quote')
+  expect(claudeToTelegramV2('\\[not\\](a link)')).toBe('\\[not\\]\\(a link\\)')
+  expect(claudeToTelegramV2('\\_\\_init\\_\\_')).toBe('\\_\\_init\\_\\_')
+  expect(claudeToTelegramV2('[docs](https://x.example/a\\)b)')).toBe('[docs](https://x.example/a\\)b)')
+  for (const source of ['\\*literal\\*', '\\> not a quote', '**a \\* b**']) {
+    expect(() => telegramText(claudeToTelegramV2(source))).not.toThrow()
+  }
+})
+
 test('formatting around backslashes still translates', () => {
   expect(claudeToTelegramV2('**C:\\temp**')).toBe('*C:\\\\temp*')
   expect(claudeToTelegramV2('`a\\b`')).toBe('`a\\\\b`')
