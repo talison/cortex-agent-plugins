@@ -128,6 +128,25 @@ test('an escaped delimiter stays a literal character, never markup', () => {
   }
 })
 
+test('backslash edge cases follow CommonMark (Fable review)', () => {
+  const shown = (s: string) => telegramText(claudeToTelegramV2(s))
+  // Escaped backticks are literal backticks, never a code span.
+  expect(claudeToTelegramV2('\\`x\\`')).toBe('\\`x\\`')
+  expect(shown('\\`x\\`')).toBe('`x`')
+  // ...while a span may still end in a backslash.
+  expect(shown('see `C:\\temp\\` here')).toBe('see C:\\temp\\ here')
+  // `\\` is an escaped backslash: one shows, as it did before this branch.
+  expect(claudeToTelegramV2('a\\\\b')).toBe('a\\\\b')
+  expect(shown('a\\\\b')).toBe('a\\b')
+  expect(shown('\\\\.')).toBe('\\.')
+  // A backslash before a newline is a hard break: just the newline.
+  expect(claudeToTelegramV2('line one\\\nline two')).toBe('line one\nline two')
+  expect(shown('two\\\\\nlines')).toBe('two\\\nlines')
+  // A pre-escape inside a link URL stays a valid URL escape.
+  expect(claudeToTelegramV2('[docs](https://x.example/a\\_b)')).toBe('[docs](https://x.example/a\\_b)')
+  expect(claudeToTelegramV2('[docs](https://x.example/a\\.b)')).toBe('[docs](https://x.example/a\\.b)')
+})
+
 test('formatting around backslashes still translates', () => {
   expect(claudeToTelegramV2('**C:\\temp**')).toBe('*C:\\\\temp*')
   expect(claudeToTelegramV2('`a\\b`')).toBe('`a\\\\b`')

@@ -1,6 +1,7 @@
 // SOURCE: harness@9b67e8012e531063cdfabebe57f62b661ba154aa src/telegram-core/markdown-translate.ts (synced 2026-04-24)
-// Backslash handling is the fork's own (2026-11-16 audit, finding 2); it
-// mirrors cortex's scripts/md-to-telegramv2.py.
+// Backslash handling is the fork's own (2026-11-16 audit, finding 2, and its
+// reviews). It follows CommonMark where cortex's scripts/md-to-telegramv2.py
+// does not: there, `\\` shows two backslashes and `\*x\*` becomes italics.
 /**
  * Telegram MarkdownV2 reserves these characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
  * Every literal occurrence must be backslash-escaped, and so must a literal
@@ -10,14 +11,20 @@
 const V2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
 
 /**
- * An escaped reserved character in prose (`snake\_case`, `v1\.2`, `\*not
- * italic\*`). Escaping it again gave `\\_`, an escaped backslash and a bare
- * `_`, which Telegram rejected, so the chunk went out plain. It is already
- * valid MarkdownV2 for the literal character, so it is parked as-is before
- * any syntax is recognised: it reads as the character and never becomes a
- * delimiter.
+ * In prose, outside code, one of:
+ *  1. a backslash escape: a backslash before a reserved character or another
+ *     backslash (`snake\_case`, `v1\.2`, `\*not italic\*`, `\\`). Escaping it
+ *     again gave `\\_`, an escaped backslash and a bare `_`, which Telegram
+ *     rejected, so the chunk went out plain. It is already valid MarkdownV2
+ *     for the literal character, so it is parked as-is before any syntax is
+ *     recognised: it never becomes a delimiter, and `\\` shows one backslash,
+ *     as CommonMark (and this translator before 2026-11-16) has it;
+ *  2. a backslash before a newline, CommonMark's hard break: just the newline;
+ *  3. an inline code span.
+ * Any other backslash (`\d`, `C:\temp`, a trailing one) is a literal and is
+ * escaped by the passes below.
  */
-const PRE_ESCAPE = /\\([_*[\]()~`>#+\-=|{}.!])/g;
+const PROSE_TOKEN_RE = /\\([_*[\]()~`>#+\-=|{}.!\\])|\\\n|`([^`\n]+)`/g;
 
 /** Matches only the `)` and `\` characters — the v2 rule for link URL escaping. */
 const V2_URL_ESCAPE = /[\\)]/g;
@@ -109,12 +116,15 @@ export function claudeToTelegramV2(text: string): string {
     return makePh(m.slice(0, open) + escapeCode(m.slice(open, close)) + m.slice(close));
   });
 
-  // 1b. Inline code.
-  text = text.replace(INLINE_CODE_RE, (_m, body: string) => makePh('`' + escapeCode(body) + '`'));
-
-  // Outside code, an escaped reserved character is parked as the literal it
-  // already is; the escape passes below then escape any other backslash once.
-  text = text.replace(PRE_ESCAPE, (m) => makePh(m));
+  // 1b. Inline code, backslash escapes and hard breaks, in one left-to-right
+  //     pass so CommonMark's precedence holds: an escaped backtick never opens
+  //     a code span (`\`x\`` is literal backticks), and inside a span a
+  //     backslash is just text (`C:\temp\` closes on its backtick).
+  text = text.replace(PROSE_TOKEN_RE, (m, escaped: string | undefined, code: string | undefined) => {
+    if (escaped !== undefined) return makePh(m);      // already the V2 escape
+    if (code === undefined) return '\n';              // `\` + newline: a hard break
+    return makePh('`' + escapeCode(code) + '`');
+  });
 
   // 1c. Links [text](url). Per v2 spec: link text escapes the full reserved
   //     set; URL escapes only `)` and `\`.
