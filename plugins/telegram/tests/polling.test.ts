@@ -1,5 +1,47 @@
 import { expect, test } from 'bun:test'
-import { runPolling, type PollFailure } from '../lib/polling.ts'
+import { lastWord, runPolling, type PollFailure } from '../lib/polling.ts'
+
+test('a process that starts shutting down inside the settle window neither claims bot.pid nor polls', async () => {
+  // A phantom server loses stdin within milliseconds; the old guard ran before
+  // any handler could fire, so a phantom still SIGTERMed the live poller
+  // (2026-11-16 audit, finding 3).
+  let shuttingDown = false
+  const events: string[] = []
+  await runPolling({
+    settleMs: 2000,
+    sleep: async ms => { events.push(`sleep ${ms}`); shuttingDown = true },
+    onSettled: () => { events.push('claim') },
+    start: async () => { events.push('start') },
+    isShuttingDown: () => shuttingDown, isConflict: () => false,
+    onFailure: () => {}, onExhausted: () => {},
+  })
+  expect(events).toEqual(['sleep 2000'])
+})
+
+test('a process that outlives the settle window claims once, then polls', async () => {
+  const events: string[] = []
+  await runPolling({
+    settleMs: 2000,
+    sleep: async ms => { events.push(`sleep ${ms}`) },
+    onSettled: () => { events.push('claim') },
+    start: async () => { events.push('start') },
+    isShuttingDown: () => false, isConflict: () => false,
+    onFailure: () => {}, onExhausted: () => {},
+  })
+  expect(events).toEqual(['sleep 2000', 'claim', 'start'])
+})
+
+test('the last word reaches every chat and never outlasts its timeout', async () => {
+  const sent: string[] = []
+  const started = Date.now()
+  await lastWord(async (chat, text) => {
+    if (chat === 'hangs') return new Promise(() => {})
+    if (chat === 'fails') throw new Error('403')
+    sent.push(`${chat}: ${text}`)
+  }, ['111', 'fails', 'hangs', '222'], 'inbound stopped', 50)
+  expect(sent).toEqual(['111: inbound stopped', '222: inbound stopped'])
+  expect(Date.now() - started).toBeLessThan(1000)
+})
 
 function fixture(start: (onPollSuccess: () => void) => Promise<void>) {
   const failures: PollFailure[] = []

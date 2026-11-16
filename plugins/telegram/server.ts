@@ -26,7 +26,7 @@ import {
   stopTyping,
 } from './core/index.js'
 import { PermissionRequests, canReplyToPermission } from './lib/permissions.js'
-import { runPolling } from './lib/polling.js'
+import { lastWord, runPolling } from './lib/polling.js'
 import { channelOwner } from './lib/owner.js'
 import { replyChunking, sendReply } from './lib/reply.js'
 import { buildChannelMeta, type AttachmentMeta } from './lib/channel-meta.js'
@@ -98,19 +98,21 @@ debugLog(`owner: ${OWNER.owner ? 'yes' : 'no'} (${OWNER.reason})`)
 if (!OWNER.owner) process.stderr.write(`telegram channel: inbound disabled — ${OWNER.reason}\n`)
 
 // Telegram allows exactly one getUpdates consumer per token. The stale-PID
-// kill + PID_FILE claim is deferred until past mcp.connect() + shutdown
-// handlers — see the block below bot.start's registration. Running this
-// code at module top would let a phantom subprocess (Claude Code spawn
-// that gets stdin:end within milliseconds) SIGTERM the currently-running
-// real poller before the phantom itself dies.
+// kill + PID_FILE claim (claimPollerSlot) waits for runPolling's settle
+// window: a phantom subprocess (a Claude Code spawn that gets stdin:end
+// within milliseconds) shuts down inside it and never SIGTERMs the
+// currently-running real poller.
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
+// stderr is lost after the MCP disconnect, so fork-debug.log gets them too.
 process.on('unhandledRejection', err => {
   process.stderr.write(`telegram channel: unhandled rejection: ${err}\n`)
+  debugLog('unhandled rejection', { error: String(err) })
 })
 process.on('uncaughtException', err => {
   process.stderr.write(`telegram channel: uncaught exception: ${err}\n`)
+  debugLog('uncaught exception', { error: String(err) })
 })
 
 // Permission-reply spec from anthropics/claude-cli-internal
@@ -566,12 +568,14 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGHUP', () => shutdown('SIGHUP'))
 
-// Claim the bot.pid slot *after* mcp.connect() + shutdown handlers above.
-// If we're a phantom (Claude Code spawned us but stdin closes within ms), the
-// shutdown handlers above fire first and set shuttingDown — we skip the
-// stale-PID SIGTERM and never write our own PID, leaving the real poller
-// alone. Only stable subprocesses reach this block.
-if (!shuttingDown && OWNER.owner) {
+// Claim the bot.pid slot. runPolling calls this once its settle window has
+// passed without a shutdown: a phantom (Claude Code spawned us but stdin
+// closes within ms) has shut down by then, so it skips the stale-PID SIGTERM
+// and never writes its own PID, leaving the real poller alone. (A check here
+// at module load could never see shuttingDown set: no handler can run in the
+// same synchronous stretch. 2026-11-16 audit, finding 3.)
+const POLL_SETTLE_MS = 2000
+function claimPollerSlot(): void {
   try {
     const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
     if (stale > 1 && stale !== process.pid) {
@@ -918,7 +922,14 @@ bot.api.config.use(async (prev, method, payload, signal) => {
   return response
 })
 
+const CONFLICT_EXIT_NOTICE =
+  '⚠️ Telegram inbound to the Cortex session has stopped: another poller holds this bot ' +
+  '(409 Conflict after 8 tries). Messages here will not reach the session until it restarts ' +
+  '(ssh cortex, then scripts/restart-cortex.sh).'
+
 if (OWNER.owner) void runPolling({
+  settleMs: POLL_SETTLE_MS,
+  onSettled: claimPollerSlot,
   isShuttingDown: () => shuttingDown,
   isConflict: error => error instanceof GrammyError && error.error_code === 409,
   isFatal: error => error instanceof GrammyError && error.error_code === 401,
@@ -953,5 +964,11 @@ if (OWNER.owner) void runPolling({
       debugLog('polling error, retrying', { detail, attempt, delay_ms: delay })
     }
   },
-  onExhausted: ({ fatal }) => shutdown(fatal ? 'polling:unauthorized' : 'polling:conflict', 1),
+  // A persistent 409 still lets the bot send, so the allowlisted DMs hear it
+  // before inbound goes quiet (2026-11-16 audit, finding 1). A 401 cannot send.
+  onExhausted: ({ fatal }) => {
+    if (fatal) return shutdown('polling:unauthorized', 1)
+    void lastWord((chat, text) => bot.api.sendMessage(chat, text), loadAccess().allowFrom, CONFLICT_EXIT_NOTICE, 5000)
+      .finally(() => shutdown('polling:conflict', 1))
+  },
 })
