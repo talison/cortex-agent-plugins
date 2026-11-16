@@ -1,12 +1,28 @@
 // SOURCE: harness@9b67e8012e531063cdfabebe57f62b661ba154aa src/telegram-core/markdown-translate.ts (synced 2026-04-24)
+// Backslash handling is the fork's own (2026-11-16 audit, finding 2); it
+// mirrors cortex's scripts/md-to-telegramv2.py.
 /**
  * Telegram MarkdownV2 reserves these characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
- * Every literal occurrence must be backslash-escaped.
+ * Every literal occurrence must be backslash-escaped, and so must a literal
+ * backslash: MarkdownV2 reads a bare `\` as an escape of whatever follows, so
+ * `\d+` showed as `d+`.
  */
-const V2_RESERVED = /[_*[\]()~`>#+\-=|{}.!]/g;
+const V2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+
+/**
+ * An LLM's defensive pre-escape (`snake\_case`, `v1\.2`) in prose. Escaping it
+ * again gave `\\_`, an escaped backslash and a bare `_`, which Telegram
+ * rejected, so the chunk went out plain. It reads as the character itself.
+ */
+const PRE_ESCAPE = /\\([_*[\]()~`>#+\-=|{}.!])/g;
 
 /** Matches only the `)` and `\` characters — the v2 rule for link URL escaping. */
 const V2_URL_ESCAPE = /[\\)]/g;
+
+/** Inside code and pre, every ` and \ is escaped, and nothing else. */
+function escapeCode(body: string): string {
+  return body.replace(/[\\`]/g, '\\$&');
+}
 
 type PlaceholderEntry = { key: string; content: string };
 
@@ -83,10 +99,19 @@ export function claudeToTelegramV2(text: string): string {
 
   // 1a. Fenced code blocks (must precede inline-code extraction so the
   //     fence's own backticks aren't picked up as inline code).
-  text = text.replace(FENCE_RE, (m) => makePh(m));
+  //     The fence lines are structure; the body between them is code.
+  text = text.replace(FENCE_RE, (m) => {
+    const open = m.indexOf('\n') + 1;
+    const close = m.lastIndexOf('\n```');
+    return makePh(m.slice(0, open) + escapeCode(m.slice(open, close)) + m.slice(close));
+  });
 
   // 1b. Inline code.
-  text = text.replace(INLINE_CODE_RE, (m) => makePh(m));
+  text = text.replace(INLINE_CODE_RE, (_m, body: string) => makePh('`' + escapeCode(body) + '`'));
+
+  // Outside code, a pre-escaped reserved character is the character itself;
+  // every escape pass below then escapes it, and any other backslash, once.
+  text = text.replace(PRE_ESCAPE, '$1');
 
   // 1c. Links [text](url). Per v2 spec: link text escapes the full reserved
   //     set; URL escapes only `)` and `\`.
